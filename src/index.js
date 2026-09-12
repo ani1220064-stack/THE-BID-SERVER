@@ -13,10 +13,15 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || (process.env.NODE_ENV === 'production' ? 10000 : 4000);
 
+const { getLandingPageHtml } = require('./views/landingPage');
+
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 app.get('/', (req, res) => {
+  if (req.accepts('html') && !req.xhr && !req.query.json) {
+    return res.status(200).send(getLandingPageHtml());
+  }
   res.status(200).json({ status: 'ok', product: 'THE BID', authoritative: true });
 });
 
