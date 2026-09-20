@@ -20,7 +20,9 @@ class RoomManager {
     this.io = io;
     this.rooms = new Map(); // roomId -> Room
     this.roomCodes = new Map(); // normalized roomCode -> roomId
-    this.matchmakingQueue = []; // [{ socket, user }]
+    this.matchmakingQueues = new Map(); // categoryId -> Map<uniqueId, { socketId, socket, user, category, timestamp }>
+    this.userLifecycle = new Map(); // normUniqueId -> 'ONLINE' | 'AVAILABLE_FOR_RANDOM' | 'MATCHED' | 'IN_GAME'
+    this.onPresenceChanged = null; // callback(normUniqueId) to broadcast real-time presence
   }
 
   // Normalizes code input: uppercase, trims, strips extra spaces, standardizes BID- prefix
@@ -78,9 +80,9 @@ class RoomManager {
     // Generate match item pool dynamically from the category module
     const matchItems = categoryModule.generatePool(participantsCount, poolSize);
 
-    // Authoritative room code generation for private rooms
+    // Authoritative room code generation for private & random rooms
     let finalRoomCode = null;
-    if (mode === 'friends') {
+    if (mode === 'friends' || mode === 'random') {
       finalRoomCode = roomCode ? this.normalizeRoomCode(roomCode) : this.generateRoomCode();
       if (this.roomCodes.has(finalRoomCode)) {
         finalRoomCode = this.generateRoomCode();
@@ -113,7 +115,7 @@ class RoomManager {
       },
       mode, // 'computer', 'random', 'friends'
       aiDifficulty: (aiDifficulty || 'MEDIUM').toUpperCase(),
-      state: mode === 'friends' ? 'SETUP' : 'BUDGET_SELECTION',
+      state: (mode === 'friends' || mode === 'random') ? 'LOBBY' : 'BUDGET_SELECTION',
       hostId: hostUser.id,
       participants: new Map(), // userId -> participant
       bots: [],
@@ -322,6 +324,10 @@ class RoomManager {
     }
 
     this.rooms.set(roomId, room);
+    const hostNorm = (hostUser.uniqueId || hostUser.bidId || hostUser.id || '').trim().toUpperCase();
+    if (this.onPresenceChanged && hostNorm) {
+      this.onPresenceChanged(hostNorm);
+    }
     return room;
   }
 
@@ -329,82 +335,434 @@ class RoomManager {
     let room = this.rooms.get(roomIdOrCode) || this.getRoomByCode(roomIdOrCode);
     if (!room) return { success: false, message: 'Invalid or expired room code.' };
 
+    const normUnique = (user.uniqueId || '').trim().toUpperCase();
+    const existingParticipant = room.participants.get(user.id) || 
+      (normUnique ? Array.from(room.participants.values()).find(p => p.uniqueId && p.uniqueId.toUpperCase() === normUnique) : null);
+
+    // Reconnection handling: update socketId and return room without adding duplicate
+    if (existingParticipant) {
+      existingParticipant.socketId = user.socketId;
+      return { success: true, room };
+    }
+
     if (room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION' && room.state !== 'LOBBY') {
-      // Allow reconnect if existing participant
-      if (room.participants.has(user.id)) {
-        const p = room.participants.get(user.id);
-        p.socketId = user.socketId;
-        return { success: true, room };
-      }
       return { success: false, message: 'Auction is already underway.' };
     }
 
-    if (!room.participants.has(user.id)) {
-      if (room.participants.size >= 10) {
-        return { success: false, message: 'Room is full (Maximum 10 participants).' };
-      }
+    if (room.participants.size >= 10) {
+      return { success: false, message: 'Room is full (Maximum 10 participants).' };
+    }
 
-      if (!room.teamOwnership) {
-        room.teamOwnership = new Map();
-      }
+    if (!room.teamOwnership) {
+      room.teamOwnership = new Map();
+    }
 
-      const categoryModule = CategoryRegistry.get(room.category);
-      const categoryFranchises = categoryModule.getFranchises ? categoryModule.getFranchises() : (categoryModule.franchises || []);
+    const categoryModule = CategoryRegistry.get(room.category);
+    const categoryFranchises = categoryModule.getFranchises ? categoryModule.getFranchises() : (categoryModule.franchises || []);
 
-      let userFranchise = null;
-      if (user.teamId && !room.teamOwnership.has(user.teamId)) {
-        userFranchise = getCategoryFranchise(categoryModule, user.teamId);
-      } else if (user.teamName) {
-        const f = getCategoryFranchise(categoryModule, user.teamName);
-        if (f && !room.teamOwnership.has(f.id)) {
-          userFranchise = f;
-        }
+    let userFranchise = null;
+    if (user.teamId && !room.teamOwnership.has(user.teamId)) {
+      userFranchise = getCategoryFranchise(categoryModule, user.teamId);
+    } else if (user.teamName) {
+      const f = getCategoryFranchise(categoryModule, user.teamName);
+      if (f && !room.teamOwnership.has(f.id)) {
+        userFranchise = f;
       }
-      // If not specified or already taken, assign first remaining unowned franchise
-      if (!userFranchise) {
-        userFranchise = categoryFranchises.find(f => !room.teamOwnership.has(f.id));
-      }
-      if (userFranchise) {
-        room.teamOwnership.set(userFranchise.id, user.id);
-      }
+    }
+    // If not specified or already taken, assign first remaining unowned franchise
+    if (!userFranchise) {
+      userFranchise = categoryFranchises.find(f => !room.teamOwnership.has(f.id));
+    }
+    if (userFranchise) {
+      room.teamOwnership.set(userFranchise.id, user.id);
+    }
 
-      if (user) {
-        store.getOrCreateUser(user);
-      }
+    if (user) {
+      store.getOrCreateUser(user);
+    }
 
-      room.participants.set(user.id, {
-        id: user.id,
-        uniqueId: user.uniqueId || user.bidId || user.id,
-        name: user.name,
-        avatar: user.avatar || 'avatar_1',
-        teamId: userFranchise ? userFranchise.id : null,
-        teamName: userFranchise ? userFranchise.name : (user.teamName || `${user.name || 'Friend'}'s XI`),
-        purse: room.proposedBudget,
-        startingBudget: room.proposedBudget,
-        squad: [],
-        isReady: false,
-        isHost: false,
-        isAI: false,
-        type: 'FRIEND',
-        socketId: user.socketId
-      });
-      // Recalculate pool if in BUDGET_SELECTION or LOBBY
-      const cat = CategoryRegistry.get(room.category);
-      room.playerPool = cat.generatePool(room.participants.size);
-      room.availablePlayerPool = [...room.playerPool];
-      room.availablePlayerIds = new Set(room.playerPool.map(p => p.id));
-      room.auctionedPlayerIds = new Set();
-      room.lotSequence = [];
-      room.lotHistoryByPlayerId = new Map();
+    room.participants.set(user.id, {
+      id: user.id,
+      uniqueId: user.uniqueId || user.bidId || user.id,
+      name: user.name,
+      avatar: user.avatar || 'avatar_1',
+      teamId: userFranchise ? userFranchise.id : null,
+      teamName: userFranchise ? userFranchise.name : (user.teamName || `${user.name || 'Friend'}'s XI`),
+      purse: room.proposedBudget,
+      startingBudget: room.proposedBudget,
+      squad: [],
+      isReady: false,
+      isHost: false,
+      isAI: false,
+      type: 'FRIEND',
+      socketId: user.socketId
+    });
 
-      // Reset budget consensus when a new human joins in BUDGET_SELECTION
-      if (room.state === 'BUDGET_SELECTION') {
-        room.budgetVotes.clear();
-        room.bots.forEach(b => room.budgetVotes.set(b.id, true));
-      }
+    // Recalculate pool if in BUDGET_SELECTION or LOBBY
+    const cat = CategoryRegistry.get(room.category);
+    room.playerPool = cat.generatePool(room.participants.size);
+    room.availablePlayerPool = [...room.playerPool];
+    room.availablePlayerIds = new Set(room.playerPool.map(p => p.id));
+    room.auctionedPlayerIds = new Set();
+    room.lotSequence = [];
+    room.lotHistoryByPlayerId = new Map();
+
+    // Reset budget consensus when a new human joins in BUDGET_SELECTION
+    if (room.state === 'BUDGET_SELECTION') {
+      room.budgetVotes.clear();
+      room.bots.forEach(b => room.budgetVotes.set(b.id, true));
+    }
+
+    if (this.onPresenceChanged && normUnique) {
+      this.onPresenceChanged(normUnique);
     }
 
     return { success: true, room };
+  }
+
+  // Active match detection across all rooms
+  isUserInActiveMatch(userId, uniqueId) {
+    const normUnique = (uniqueId || '').trim().toUpperCase();
+    for (const room of this.rooms.values()) {
+      if (room && room.state !== 'RESULTS' && room.participants) {
+        for (const p of room.participants.values()) {
+          if (!p.isAI) {
+            if (p.id === userId || (p.uniqueId && normUnique && p.uniqueId.toUpperCase() === normUnique)) {
+              return room;
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  findActiveRoomForUser(userId, uniqueId) {
+    return this.isUserInActiveMatch(userId, uniqueId);
+  }
+
+  isUserInMatchmakingQueue(uniqueId) {
+    if (!uniqueId) return false;
+    const norm = uniqueId.trim().toUpperCase();
+    for (const queueMap of this.matchmakingQueues.values()) {
+      if (queueMap.has(norm)) return true;
+    }
+    return false;
+  }
+
+  getUserPresence(uniqueId, hasActiveSockets = false) {
+    if (!hasActiveSockets) {
+      return 'OFFLINE';
+    }
+    const norm = (uniqueId || '').trim().toUpperCase();
+    if (!norm) return 'OFFLINE';
+
+    // Check if currently waiting in matchmaking queue
+    if (this.isUserInMatchmakingQueue(norm)) {
+      return 'BUSY';
+    }
+
+    // Check if currently in an active room
+    const activeRoom = this.isUserInActiveMatch(null, norm);
+    if (activeRoom && activeRoom.state !== 'RESULTS') {
+      return 'BUSY';
+    }
+
+    return 'AVAILABLE';
+  }
+
+  leaveRoom(roomId, userId, uniqueId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return { success: false, message: 'Room not found' };
+
+    const normUnique = (uniqueId || '').trim().toUpperCase();
+    let participantId = null;
+
+    for (const [pId, p] of room.participants.entries()) {
+      if (pId === userId || (p.uniqueId && normUnique && p.uniqueId.toUpperCase() === normUnique)) {
+        participantId = pId;
+        break;
+      }
+    }
+
+    if (!participantId) {
+      return { success: false, message: 'Participant not in room' };
+    }
+
+    const leavingParticipant = room.participants.get(participantId);
+    const wasHost = leavingParticipant?.isHost || room.hostId === participantId;
+    const effectiveUniqueId = leavingParticipant?.uniqueId || uniqueId;
+
+    // Release team ownership
+    if (room.teamOwnership) {
+      for (const [teamId, ownerId] of room.teamOwnership.entries()) {
+        if (ownerId === participantId) {
+          room.teamOwnership.delete(teamId);
+        }
+      }
+    }
+
+    // Release budget vote if in budget selection
+    if (room.budgetVotes) {
+      room.budgetVotes.delete(participantId);
+    }
+
+    const isLiveAuction = room.state === 'AUCTION_ACTIVE' || room.state === 'SOLD' || room.state === 'UNSOLD' || room.state === 'PAUSED';
+
+    // Remove or convert participant
+    if (isLiveAuction && !wasHost) {
+      // In live auction with remaining humans, convert leaving player to computer bot
+      // to maintain competitive roster integrity without breaking squad allocations or current leader bids
+      leavingParticipant.isAI = true;
+      leavingParticipant.type = 'COMPUTER';
+      leavingParticipant.name = `${leavingParticipant.name} (AI)`;
+
+      const bot = new AuctionBot({
+        id: leavingParticipant.id,
+        name: leavingParticipant.name,
+        teamId: leavingParticipant.teamId,
+        teamName: leavingParticipant.teamName,
+        strategy: 'balanced',
+        avatar: leavingParticipant.avatar,
+        difficulty: room.aiDifficulty || 'MEDIUM'
+      });
+      room.bots.push(bot);
+    } else {
+      room.participants.delete(participantId);
+    }
+
+    // Update lifecycle state of leaving user to AVAILABLE
+    if (effectiveUniqueId) {
+      const normU = effectiveUniqueId.trim().toUpperCase();
+      this.userLifecycle.set(normU, 'AVAILABLE');
+      if (this.onPresenceChanged) {
+        this.onPresenceChanged(normU);
+      }
+    }
+
+    console.log(`[RoomManager] User ${participantId} (${effectiveUniqueId}) left room ${roomId}. Remaining participants: ${room.participants.size}`);
+
+    // If host leaves or no human participants remain:
+    const remainingHumans = Array.from(room.participants.values()).filter(p => !p.isAI);
+    if (wasHost || remainingHumans.length === 0) {
+      // Safest existing room behavior: close room when host leaves or when empty
+      if (room.timerInterval) clearInterval(room.timerInterval);
+      if (room.lotTimeout) clearTimeout(room.lotTimeout);
+      if (room.aiBidTimeout) clearTimeout(room.aiBidTimeout);
+      if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
+
+      if (room.roomCode) {
+        this.roomCodes.delete(this.normalizeRoomCode(room.roomCode));
+      }
+      store.cancelInvitationsForRoom(roomId);
+      this.rooms.delete(roomId);
+
+      // Notify any remaining sockets in the room that room has closed
+      this.io.to(roomId).emit('room_closed', {
+        roomId,
+        message: 'Host has closed or left the room.'
+      });
+      console.log(`[RoomManager] Room ${roomId} closed and cleaned up.`);
+      return { success: true, roomClosed: true };
+    } else {
+      // Room continues with remaining participants: broadcast updated room state
+      this.broadcastRoomState(room);
+      return { success: true, roomClosed: false, room };
+    }
+  }
+
+  // Real-time Global Matchmaking
+  joinRandomQueue(user, category = 'ipl_cricket', socket) {
+    if (!user || (!user.uniqueId && !user.id)) {
+      return { success: false, message: 'Authentication required for matchmaking.' };
+    }
+    const normUniqueId = (user.uniqueId || user.id).trim().toUpperCase();
+    const catId = category || 'ipl_cricket';
+
+    // Verify user is not already in an active match
+    const activeMatch = this.isUserInActiveMatch(user.id, user.uniqueId);
+    if (activeMatch) {
+      return { success: false, message: 'Already in an active game session.', activeRoomId: activeMatch.id };
+    }
+
+    // Ensure only ONE active queue entry per user across all categories
+    for (const [cId, queueMap] of this.matchmakingQueues.entries()) {
+      queueMap.delete(normUniqueId);
+    }
+
+    if (!this.matchmakingQueues.has(catId)) {
+      this.matchmakingQueues.set(catId, new Map());
+    }
+
+    const queueMap = this.matchmakingQueues.get(catId);
+    queueMap.set(normUniqueId, {
+      socketId: socket.id,
+      user,
+      category: catId,
+      timestamp: Date.now()
+    });
+
+    this.userLifecycle.set(normUniqueId, 'AVAILABLE_FOR_RANDOM');
+    console.log(`[Matchmaking] User ${normUniqueId} joined queue for ${catId}. Queue size: ${queueMap.size}`);
+
+    if (this.onPresenceChanged) {
+      this.onPresenceChanged(normUniqueId);
+    }
+
+    // Immediately check if an atomic match can be made
+    this.processMatchmakingQueue(catId);
+
+    return { success: true, queueSize: queueMap.size };
+  }
+
+  leaveRandomQueue(uniqueId, category) {
+    const normUniqueId = (uniqueId || '').trim().toUpperCase();
+    if (!normUniqueId) return;
+
+    if (category && this.matchmakingQueues.has(category)) {
+      this.matchmakingQueues.get(category).delete(normUniqueId);
+    } else {
+      for (const queueMap of this.matchmakingQueues.values()) {
+        queueMap.delete(normUniqueId);
+      }
+    }
+    this.userLifecycle.set(normUniqueId, 'ONLINE');
+    console.log(`[Matchmaking] User ${normUniqueId} left queue`);
+    if (this.onPresenceChanged) {
+      this.onPresenceChanged(normUniqueId);
+    }
+  }
+
+  removeSocketFromMatchmaking(socketId) {
+    for (const queueMap of this.matchmakingQueues.values()) {
+      for (const [uId, entry] of queueMap.entries()) {
+        if (entry.socketId === socketId) {
+          queueMap.delete(uId);
+          this.userLifecycle.delete(uId);
+          console.log(`[Matchmaking] Removed disconnected socket ${socketId} (user ${uId}) from queue`);
+          if (this.onPresenceChanged) {
+            this.onPresenceChanged(uId);
+          }
+        }
+      }
+    }
+  }
+
+  processMatchmakingQueue(catId) {
+    const queueMap = this.matchmakingQueues.get(catId);
+    if (!queueMap || queueMap.size < 2) return;
+
+    // Filter out disconnected sockets
+    for (const [uId, entry] of queueMap.entries()) {
+      const sock = this.io.sockets.sockets.get(entry.socketId);
+      if (!sock || !sock.connected) {
+        queueMap.delete(uId);
+        this.userLifecycle.delete(uId);
+        if (this.onPresenceChanged) {
+          this.onPresenceChanged(uId);
+        }
+      }
+    }
+
+    if (queueMap.size < 2) return;
+
+    // Get first two eligible distinct players (strictly prevent self-matching)
+    const queueEntries = Array.from(queueMap.values());
+    let entryA = null;
+    let entryB = null;
+
+    for (let i = 0; i < queueEntries.length; i++) {
+      for (let j = i + 1; j < queueEntries.length; j++) {
+        const a = queueEntries[i];
+        const b = queueEntries[j];
+        const idA = (a.user.uniqueId || a.user.id || '').trim().toUpperCase();
+        const idB = (b.user.uniqueId || b.user.id || '').trim().toUpperCase();
+        if (idA !== idB && a.socketId !== b.socketId) {
+          entryA = a;
+          entryB = b;
+          break;
+        }
+      }
+      if (entryA && entryB) break;
+    }
+
+    if (!entryA || !entryB) return;
+
+    const normA = (entryA.user.uniqueId || entryA.user.id).trim().toUpperCase();
+    const normB = (entryB.user.uniqueId || entryB.user.id).trim().toUpperCase();
+
+    // Atomically remove both players from queue
+    queueMap.delete(normA);
+    queueMap.delete(normB);
+    this.userLifecycle.set(normA, 'MATCHED');
+    this.userLifecycle.set(normB, 'MATCHED');
+
+    if (this.onPresenceChanged) {
+      this.onPresenceChanged(normA);
+      this.onPresenceChanged(normB);
+    }
+
+    console.log(`[Matchmaking] ATOMIC MATCH: ${normA} vs ${normB} in ${catId}`);
+
+    // Create random multiplayer room
+    const roomId = `room_rand_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 4)}`;
+    const roomCode = this.generateRoomCode();
+
+    const room = this.createRoom({
+      roomId,
+      hostUser: entryA.user,
+      category: catId,
+      mode: 'random',
+      roomCode,
+      participantCount: 4
+    });
+
+    room.state = 'LOBBY';
+
+    // Add Player B to the room
+    this.joinRoom(roomId, entryB.user);
+
+    // Join sockets to room
+    const socketA = this.io.sockets.sockets.get(entryA.socketId);
+    const socketB = this.io.sockets.sockets.get(entryB.socketId);
+
+    if (socketA) socketA.join(roomId);
+    if (socketB) socketB.join(roomId);
+
+    this.userLifecycle.set(normA, 'IN_GAME');
+    this.userLifecycle.set(normB, 'IN_GAME');
+
+    const matchPayload = {
+      roomId: room.id,
+      roomCode: room.roomCode,
+      category: room.category,
+      categoryTitle: room.categoryConfig?.title || 'Auction Arena'
+    };
+
+    if (socketA) {
+      socketA.emit('random_match_found', {
+        ...matchPayload,
+        opponent: {
+          name: entryB.user.name,
+          uniqueId: entryB.user.uniqueId,
+          avatar: entryB.user.avatar
+        }
+      });
+    }
+
+    if (socketB) {
+      socketB.emit('random_match_found', {
+        ...matchPayload,
+        opponent: {
+          name: entryA.user.name,
+          uniqueId: entryA.user.uniqueId,
+          avatar: entryA.user.avatar
+        }
+      });
+    }
+
+    // Broadcast authoritative room state
+    this.broadcastRoomState(room);
   }
 
   // Handle Starting Budget Negotiation (Screens 12 & 13)
@@ -1369,84 +1727,6 @@ class RoomManager {
     if (room.reactions.length > 20) room.reactions.shift();
 
     this.io.to(room.id).emit('reaction_posted', rxPayload);
-  }
-
-  leaveRoom(roomId, userId) {
-    const room = this.rooms.get(roomId);
-    if (!room) return;
-
-    // Check if other humans exist besides this leaving user
-    const otherHumans = Array.from(room.participants.values()).filter(p => !p.isAI && p.id !== userId);
-
-    if (otherHumans.length === 0) {
-      // No remaining human players: clean up room completely and immediately
-      if (room.timerInterval) clearInterval(room.timerInterval);
-      if (room.lotTimeout) clearTimeout(room.lotTimeout);
-      if (room.aiBidTimeout) clearTimeout(room.aiBidTimeout);
-      if (room.roomCode) {
-        this.roomCodes.delete(this.normalizeRoomCode(room.roomCode));
-      }
-      store.cancelInvitationsForRoom(roomId);
-      this.rooms.delete(roomId);
-      return;
-    }
-
-    const leavingPart = room.participants.get(userId);
-    const isLiveAuction = room.state === 'AUCTION_ACTIVE' || room.state === 'SOLD' || room.state === 'UNSOLD';
-
-    // In pre-auction phases, release any team reserved by the leaving user
-    if (room.state === 'SETUP' || room.state === 'BUDGET_SELECTION' || room.state === 'LOBBY') {
-      if (room.teamOwnership) {
-        for (const [tId, uId] of room.teamOwnership.entries()) {
-          if (uId === userId) {
-            room.teamOwnership.delete(tId);
-          }
-        }
-      }
-      if (room.budgetVotes) {
-        room.budgetVotes.delete(userId);
-      }
-      room.participants.delete(userId);
-
-      // In BUDGET_SELECTION, check if all remaining participants have agreed
-      if (room.state === 'BUDGET_SELECTION' && room.participants.size > 0) {
-        const allAgreed = Array.from(room.participants.keys()).every(id => room.budgetVotes.get(id) === true);
-        if (allAgreed) {
-          room.participants.forEach(p => {
-            p.purse = room.proposedBudget;
-            p.startingBudget = room.proposedBudget;
-          });
-          room.state = 'LOBBY';
-        }
-      }
-    } else if (isLiveAuction && leavingPart) {
-      // In live auction with remaining humans, convert leaving player to a computer bot
-      // to maintain competitive roster integrity without breaking squad allocations or current leader bids
-      leavingPart.isAI = true;
-      leavingPart.type = 'COMPUTER';
-      leavingPart.name = `${leavingPart.name} (AI)`;
-
-      const bot = new AuctionBot({
-        id: leavingPart.id,
-        name: leavingPart.name,
-        teamId: leavingPart.teamId,
-        teamName: leavingPart.teamName,
-        strategy: 'balanced',
-        avatar: leavingPart.avatar,
-        difficulty: room.aiDifficulty || 'MEDIUM'
-      });
-      room.bots.push(bot);
-    } else {
-      room.participants.delete(userId);
-    }
-
-    // Transfer host to next human if leaving user was host
-    if (room.hostId === userId && otherHumans.length > 0) {
-      room.hostId = otherHumans[0].id;
-      otherHumans[0].isHost = true;
-    }
-
-    this.broadcastRoomState(room);
   }
 }
 

@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS match_history (
     completed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS room_invitations (
+    id VARCHAR(64) PRIMARY KEY,
+    sender_id VARCHAR(64),
+    sender_unique_id VARCHAR(32) NOT NULL,
+    sender_name VARCHAR(64),
+    sender_avatar VARCHAR(64),
+    recipient_unique_id VARCHAR(32) NOT NULL,
+    room_id VARCHAR(64) NOT NULL,
+    room_code VARCHAR(32) NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    category_title VARCHAR(128),
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_bid_id ON users(bid_id);
 CREATE INDEX IF NOT EXISTS idx_friends_user_id ON friends(user_id);
 CREATE INDEX IF NOT EXISTS idx_match_history_user_id ON match_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_invitations_recipient ON room_invitations(recipient_unique_id);

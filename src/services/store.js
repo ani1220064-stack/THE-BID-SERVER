@@ -333,7 +333,7 @@ class StoreService {
       };
     }
 
-    // 3. Prevent duplicate requests (Idempotent server-side storage)
+    // 3. Handle existing request: re-notify if throttled >= 1.8s
     if (!this.data.friendRequests[target.uniqueId]) {
       this.data.friendRequests[target.uniqueId] = [];
     }
@@ -342,18 +342,49 @@ class StoreService {
       r => r.fromUniqueId.toUpperCase() === fromUser.uniqueId.toUpperCase()
     );
     if (existingReq) {
-      return { success: false, error: 'DUPLICATE_REQUEST', message: 'Friend request already sent to this player.' };
+      const now = Date.now();
+      const lastSent = existingReq.lastSentAt || (existingReq.date ? new Date(existingReq.date).getTime() : 0);
+      if (now - lastSent < 1800) {
+        return {
+          success: false,
+          throttled: true,
+          waitMs: Math.max(0, 1800 - (now - lastSent)),
+          message: 'Please wait a moment before sending another notification.'
+        };
+      }
+      existingReq.lastSentAt = now;
+      existingReq.date = new Date(now).toISOString();
+      existingReq.fromName = fromUser.name || existingReq.fromName;
+      existingReq.fromAvatar = fromUser.avatar || existingReq.fromAvatar;
+      this.saveData();
+      return {
+        success: true,
+        reNotified: true,
+        request: existingReq,
+        targetUser: target,
+        fromUser,
+        message: `Request notification re-sent to ${target.name}`
+      };
     }
 
-    this.data.friendRequests[target.uniqueId].push({
+    const newReq = {
+      id: `freq_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       fromUniqueId: fromUser.uniqueId,
       fromName: fromUser.name || 'A Player',
       fromAvatar: fromUser.avatar || 'avatar_1',
-      date: new Date().toISOString()
-    });
+      date: new Date().toISOString(),
+      lastSentAt: Date.now()
+    };
+    this.data.friendRequests[target.uniqueId].push(newReq);
 
     this.saveData();
-    return { success: true, message: `Request sent to ${target.name}` };
+    return {
+      success: true,
+      request: newReq,
+      targetUser: target,
+      fromUser,
+      message: `Request sent to ${target.name}`
+    };
   }
 
   acceptFriendRequest(userUniqueId, fromUniqueId) {
@@ -537,10 +568,21 @@ class StoreService {
       inv.expiresAt > Date.now()
     );
 
+    const now = Date.now();
     if (existing) {
-      existing.expiresAt = Date.now() + 10 * 60 * 1000;
+      const lastSent = existing.lastSentAt || existing.createdAt || 0;
+      if (now - lastSent < 1800) {
+        return {
+          invitation: existing,
+          isDuplicate: true,
+          throttled: true,
+          waitMs: Math.max(0, 1800 - (now - lastSent))
+        };
+      }
+      existing.lastSentAt = now;
+      existing.expiresAt = now + 10 * 60 * 1000;
       this.saveData();
-      return { invitation: existing, isDuplicate: true };
+      return { invitation: existing, isDuplicate: true, reNotified: true };
     }
 
     const invitation = {
@@ -557,8 +599,9 @@ class StoreService {
       category,
       categoryTitle: categoryTitle || 'Auction Room',
       status: 'PENDING',
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 10 * 60 * 1000 // 10 minutes validity
+      createdAt: now,
+      lastSentAt: now,
+      expiresAt: now + 10 * 60 * 1000 // 10 minutes validity
     };
 
     this.data.roomInvitations[invitation.id] = invitation;

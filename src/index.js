@@ -33,6 +33,7 @@ const handleApkDownload = (req, res) => {
 
 app.get('/download/THE_BID_Production_v1.0.0.apk', handleApkDownload);
 app.get('/THE_BID_Production_v1.0.0.apk', handleApkDownload);
+app.get('/thebid.apk', handleApkDownload);
 app.get('/download/apk', handleApkDownload);
 app.get('/api/download/apk', handleApkDownload);
 
@@ -226,6 +227,70 @@ const io = new Server(server, {
 });
 
 const roomManager = new RoomManager(io);
+
+// Multi-Socket Registry: Maps User Unique IDs to active Socket IDs (supporting multiple devices/tabs)
+const userSockets = new Map(); // normUniqueId -> Set<socket.id>
+const socketUsers = new Map(); // socket.id -> normUniqueId
+
+function registerUserSocket(uniqueId, socketId) {
+  if (!uniqueId) return;
+  const normId = uniqueId.trim().toUpperCase();
+  if (!userSockets.has(normId)) {
+    userSockets.set(normId, new Set());
+  }
+  userSockets.get(normId).add(socketId);
+  socketUsers.set(socketId, normId);
+}
+
+function unregisterUserSocket(socketId) {
+  const normId = socketUsers.get(socketId);
+  if (normId && userSockets.has(normId)) {
+    const set = userSockets.get(normId);
+    if (set instanceof Set) {
+      set.delete(socketId);
+      if (set.size === 0) {
+        userSockets.delete(normId);
+      }
+    } else {
+      userSockets.delete(normId);
+    }
+  }
+  socketUsers.delete(socketId);
+}
+
+function emitToUser(uniqueId, eventName, data) {
+  if (!uniqueId) return;
+  const normId = uniqueId.trim().toUpperCase();
+  const sockets = userSockets.get(normId);
+  if (sockets && sockets.size > 0) {
+    for (const sId of sockets) {
+      io.to(sId).emit(eventName, data);
+    }
+  }
+}
+
+function broadcastPresenceChange(uniqueId) {
+  if (!uniqueId) return;
+  const normId = uniqueId.trim().toUpperCase();
+  const hasSockets = userSockets.has(normId) && userSockets.get(normId).size > 0;
+  const status = roomManager.getUserPresence(normId, hasSockets);
+
+  // Broadcast to all of the user's friends
+  const user = store.findUserByUniqueId(normId);
+  if (!user) return;
+  const friends = store.data.friends[user.uniqueId] || [];
+
+  for (const friendId of friends) {
+    emitToUser(friendId, 'friend_presence_updated', {
+      uniqueId: user.uniqueId,
+      status
+    });
+  }
+}
+
+roomManager.onPresenceChanged = (normUniqueId) => {
+  broadcastPresenceChange(normUniqueId);
+};
 
 // REST API Endpoints
 app.get('/api/health', (req, res) => {
@@ -487,18 +552,56 @@ app.post('/api/friends/search', (req, res) => {
 app.post('/api/friends/request', (req, res) => {
   const { fromUniqueId, toUniqueId } = req.body;
   const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
+
+  if (result.success && !result.autoAccepted && result.request) {
+    // Emit real-time notification immediately to recipient's active socket(s)
+    emitToUser(toUniqueId, 'friend_request_received', {
+      id: result.request.id,
+      fromUniqueId: result.request.fromUniqueId,
+      fromName: result.request.fromName,
+      fromAvatar: result.request.fromAvatar,
+      trophies: result.fromUser ? (result.fromUser.trophies || 0) : 0,
+      timestamp: Date.now(),
+      reNotified: !!result.reNotified
+    });
+  } else if (result.success && result.autoAccepted) {
+    emitToUser(toUniqueId, 'friend_request_accepted', {
+      friendUniqueId: fromUniqueId,
+      friendName: result.fromUser ? result.fromUser.name : fromUniqueId
+    });
+    emitToUser(fromUniqueId, 'friend_request_accepted', {
+      friendUniqueId: toUniqueId,
+      friendName: result.targetUser ? result.targetUser.name : toUniqueId
+    });
+  }
+
   res.json(result);
 });
 
 app.post('/api/friends/accept', (req, res) => {
   const { userUniqueId, fromUniqueId } = req.body;
   const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
+  if (result.success) {
+    emitToUser(fromUniqueId, 'friend_request_accepted', {
+      friendUniqueId: userUniqueId,
+      friendName: result.user ? result.user.name : userUniqueId
+    });
+    emitToUser(userUniqueId, 'friend_request_accepted', {
+      friendUniqueId: fromUniqueId,
+      friendName: result.fromUser ? result.fromUser.name : fromUniqueId
+    });
+  }
   res.json(result);
 });
 
 app.post('/api/friends/decline', (req, res) => {
   const { userUniqueId, fromUniqueId } = req.body;
   const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
+  if (result.success) {
+    emitToUser(fromUniqueId, 'friend_request_declined', {
+      friendUniqueId: userUniqueId
+    });
+  }
   res.json(result);
 });
 
@@ -507,7 +610,13 @@ app.get('/api/friends/:uniqueId', (req, res) => {
   if (!reqId || typeof reqId !== 'string' || reqId.includes('..') || ['__proto__', 'constructor', 'prototype'].includes(reqId.toLowerCase())) {
     return res.status(400).json({ error: 'Invalid Player ID format' });
   }
-  const friends = store.getFriendsList(reqId);
+  const rawFriends = store.getFriendsList(reqId);
+  const friends = rawFriends.map(f => {
+    const norm = (f.uniqueId || '').trim().toUpperCase();
+    const hasSockets = userSockets.has(norm) && userSockets.get(norm).size > 0;
+    const status = roomManager.getUserPresence(norm, hasSockets);
+    return { ...f, status, isOnline: status !== 'OFFLINE' };
+  });
   const requests = store.getFriendRequests(reqId);
   res.json({ friends, requests });
 });
@@ -540,7 +649,39 @@ app.get('/api/invitations/:uniqueId', (req, res) => {
 // Testing Support Endpoints (Isolated for Multiplayer Simulation & Automated Teardown)
 app.post('/api/testing/cleanup-mock-accounts', (req, res) => {
   const { mockIds } = req.body || {};
-  const result = store.purgeMockTestAccounts(mockIds || ['BID-77AV91', 'BID-88PS42', 'BID-99KM63']);
+  const cleanIds = (mockIds || ['BID-77AV91', 'BID-88PS42', 'BID-99KM63']).map(id => id.trim().toUpperCase());
+  const result = store.purgeMockTestAccounts(cleanIds);
+
+  // Clean up any active rooms involving these test accounts from roomManager
+  for (const [roomId, room] of Array.from(roomManager.rooms.entries())) {
+    let hasMock = false;
+    if (room && room.participants) {
+      for (const p of room.participants.values()) {
+        if (p.uniqueId && cleanIds.includes(p.uniqueId.toUpperCase())) {
+          hasMock = true;
+          break;
+        }
+      }
+    }
+    if (hasMock) {
+      if (room.timerInterval) clearInterval(room.timerInterval);
+      if (room.lotTimeout) clearTimeout(room.lotTimeout);
+      if (room.aiBidTimeout) clearTimeout(room.aiBidTimeout);
+      if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
+      if (room.roomCode) {
+        roomManager.roomCodes.delete(roomManager.normalizeRoomCode(room.roomCode));
+      }
+      roomManager.rooms.delete(roomId);
+    }
+  }
+
+  // Also remove from matchmaking queues
+  for (const queueMap of roomManager.matchmakingQueues.values()) {
+    for (const mId of cleanIds) {
+      queueMap.delete(mId);
+    }
+  }
+
   res.json({ success: true, ...result });
 });
 
@@ -550,33 +691,129 @@ app.post('/api/testing/reload-store', (req, res) => {
 });
 
 app.get('/api/testing/active-sockets', (req, res) => {
-  const registered = Array.from(userSockets.entries()).map(([uniqueId, socketId]) => ({ uniqueId, socketId }));
+  const registered = Array.from(userSockets.entries()).map(([uniqueId, set]) => ({ uniqueId, sockets: Array.from(set) }));
   res.json({
     connectedCount: io.sockets.sockets.size,
     registeredUsers: registered
   });
 });
 
-// Socket Registry: Maps User Unique IDs to active Socket IDs
-const userSockets = new Map(); // uniqueId -> socket.id
-const socketUsers = new Map(); // socket.id -> uniqueId
-
 // Socket.IO Multiplayer Real-Time Engine
 io.on('connection', (socket) => {
   console.log(`[Socket] Connected: ${socket.id}`);
 
-  // Register user identity to receive direct room invitations
+  // Register user identity to receive direct room invitations and friend requests
   socket.on('register_user', ({ user }) => {
-    if (!user || !user.uniqueId) return;
-    const normId = user.uniqueId.trim().toUpperCase();
-    userSockets.set(normId, socket.id);
-    socketUsers.set(socket.id, normId);
+    if (!user || (!user.uniqueId && !user.id)) return;
+    const normId = (user.uniqueId || user.id).trim().toUpperCase();
+    registerUserSocket(normId, socket.id);
+    broadcastPresenceChange(normId);
     console.log(`[Socket] Registered user ${normId} to socket ${socket.id}`);
 
     // Check for any pending room invitations upon connecting/registering
-    const pending = store.getPendingInvitations(normId);
-    if (pending.length > 0) {
-      socket.emit('room_invitations_batch', pending);
+    const pendingInvites = store.getPendingInvitations(normId);
+    if (pendingInvites.length > 0) {
+      socket.emit('room_invitations_batch', pendingInvites);
+    }
+
+    // Check for any pending friend requests upon connecting/registering
+    const pendingRequests = store.getFriendRequests(normId);
+    if (pendingRequests.length > 0) {
+      socket.emit('friend_requests_batch', pendingRequests);
+    }
+
+    // Reconnect to active room if player was in an ongoing game
+    const activeRoom = roomManager.findActiveRoomForUser(user.id, normId);
+    if (activeRoom) {
+      socket.join(activeRoom.id);
+      const p = activeRoom.participants.get(user.id) || 
+        Array.from(activeRoom.participants.values()).find(x => x.uniqueId && x.uniqueId.toUpperCase() === normId);
+      if (p) {
+        p.socketId = socket.id;
+      }
+      roomManager.broadcastRoomState(activeRoom);
+      console.log(`[Socket] Re-synchronized active room ${activeRoom.id} for user ${normId}`);
+    }
+  });
+
+  // Global Real-Time Random Matchmaking
+  socket.on('join_random_queue', ({ user, category }) => {
+    if (!user) return;
+    const normId = (user.uniqueId || user.id).trim().toUpperCase();
+    registerUserSocket(normId, socket.id);
+    const result = roomManager.joinRandomQueue(user, category, socket);
+    broadcastPresenceChange(normId);
+    if (result.success) {
+      socket.emit('random_queue_joined', { category, queueSize: result.queueSize });
+    } else {
+      socket.emit('error_message', { message: result.message });
+      if (result.activeRoomId) {
+        const room = roomManager.getRoom(result.activeRoomId);
+        if (room) {
+          socket.join(room.id);
+          roomManager.broadcastRoomState(room);
+        }
+      }
+    }
+  });
+
+  socket.on('leave_random_queue', ({ user, category }) => {
+    const normId = (user?.uniqueId || user?.id || '').trim().toUpperCase();
+    roomManager.leaveRandomQueue(normId, category);
+    socket.emit('random_match_cancelled');
+    if (normId) {
+      broadcastPresenceChange(normId);
+    }
+  });
+
+  // Real-Time Friend Request Socket Actions
+  socket.on('send_friend_request', ({ fromUniqueId, toUniqueId }) => {
+    const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
+    if (result.success && !result.autoAccepted && result.request) {
+      emitToUser(toUniqueId, 'friend_request_received', {
+        id: result.request.id,
+        fromUniqueId: result.request.fromUniqueId,
+        fromName: result.request.fromName,
+        fromAvatar: result.request.fromAvatar,
+        trophies: result.fromUser ? (result.fromUser.trophies || 0) : 0,
+        timestamp: Date.now(),
+        reNotified: !!result.reNotified
+      });
+      socket.emit('friend_request_sent', { toUniqueId, reNotified: !!result.reNotified });
+    } else if (result.success && result.autoAccepted) {
+      emitToUser(toUniqueId, 'friend_request_accepted', {
+        friendUniqueId: fromUniqueId,
+        friendName: result.fromUser ? result.fromUser.name : fromUniqueId
+      });
+      emitToUser(fromUniqueId, 'friend_request_accepted', {
+        friendUniqueId: toUniqueId,
+        friendName: result.targetUser ? result.targetUser.name : toUniqueId
+      });
+    } else {
+      socket.emit('friend_request_error', { message: result.message || 'Could not send friend request' });
+    }
+  });
+
+  socket.on('respond_friend_request', ({ userUniqueId, fromUniqueId, accept }) => {
+    if (accept) {
+      const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
+      if (result.success) {
+        emitToUser(fromUniqueId, 'friend_request_accepted', {
+          friendUniqueId: userUniqueId,
+          friendName: result.user ? result.user.name : userUniqueId
+        });
+        emitToUser(userUniqueId, 'friend_request_accepted', {
+          friendUniqueId: fromUniqueId,
+          friendName: result.fromUser ? result.fromUser.name : fromUniqueId
+        });
+      }
+    } else {
+      const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
+      if (result.success) {
+        emitToUser(fromUniqueId, 'friend_request_declined', {
+          friendUniqueId: userUniqueId
+        });
+      }
     }
   });
 
@@ -599,8 +836,8 @@ io.on('connection', (socket) => {
     const user = rawUser ? { ...rawUser } : { id: socket.id, name: 'Host', uniqueId: 'TB-HOST', avatar: 'avatar_1' };
     if (user.uniqueId) {
       const normId = user.uniqueId.trim().toUpperCase();
-      userSockets.set(normId, socket.id);
-      socketUsers.set(socket.id, normId);
+      registerUserSocket(normId, socket.id);
+      broadcastPresenceChange(normId);
     }
 
     // Guard: Guests cannot create private friend rooms
@@ -643,11 +880,7 @@ io.on('connection', (socket) => {
             category: room.category,
             categoryTitle: room.categoryConfig?.title || 'Auction Room'
           });
-          const normRecipient = p.uniqueId.trim().toUpperCase();
-          const recipientSocketId = userSockets.get(normRecipient);
-          if (recipientSocketId) {
-            io.to(recipientSocketId).emit('room_invitation_received', inviteResult.invitation);
-          }
+          emitToUser(p.uniqueId, 'room_invitation_received', inviteResult.invitation);
         }
       });
     }
@@ -658,8 +891,8 @@ io.on('connection', (socket) => {
     const user = rawUser ? { ...rawUser } : { id: socket.id, name: 'Bidder', uniqueId: 'TB-BIDDER', avatar: 'avatar_1' };
     if (user.uniqueId) {
       const normId = user.uniqueId.trim().toUpperCase();
-      userSockets.set(normId, socket.id);
-      socketUsers.set(socket.id, normId);
+      registerUserSocket(normId, socket.id);
+      broadcastPresenceChange(normId);
     }
 
     const codeOrId = roomCode || roomId;
@@ -707,15 +940,12 @@ io.on('connection', (socket) => {
     socket.emit('room_invite_sent', {
       friendUniqueId,
       invitationId: inviteResult.invitation.id,
-      isDuplicate: inviteResult.isDuplicate
+      isDuplicate: inviteResult.isDuplicate,
+      reNotified: !!inviteResult.reNotified
     });
 
-    // If friend is online, send real-time notification
-    const normRecipient = friendUniqueId.trim().toUpperCase();
-    const recipientSocketId = userSockets.get(normRecipient);
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('room_invitation_received', inviteResult.invitation);
-    }
+    // If friend is online, send real-time notification to all active sockets
+    emitToUser(friendUniqueId, 'room_invitation_received', inviteResult.invitation);
   });
 
   socket.on('respond_room_invite', ({ invitationId, response, user }) => {
@@ -729,15 +959,11 @@ io.on('connection', (socket) => {
 
     if (response === 'DECLINED') {
       store.updateInvitationStatus(invitationId, 'DECLINED');
-      const hostNorm = invitation.sender.uniqueId.trim().toUpperCase();
-      const hostSocketId = userSockets.get(hostNorm);
-      if (hostSocketId) {
-        io.to(hostSocketId).emit('room_invite_declined', {
-          friendName: user.name || 'Friend',
-          friendUniqueId: user.uniqueId,
-          roomCode: invitation.roomCode
-        });
-      }
+      emitToUser(invitation.sender.uniqueId, 'room_invite_declined', {
+        friendName: user.name || 'Friend',
+        friendUniqueId: user.uniqueId,
+        roomCode: invitation.roomCode
+      });
       socket.emit('room_invite_responded', { invitationId, response: 'DECLINED' });
       return;
     }
@@ -766,15 +992,11 @@ io.on('connection', (socket) => {
       });
       roomManager.broadcastRoomState(joinResult.room);
 
-      const hostNorm = invitation.sender.uniqueId.trim().toUpperCase();
-      const hostSocketId = userSockets.get(hostNorm);
-      if (hostSocketId) {
-        io.to(hostSocketId).emit('room_invite_accepted', {
-          friendName: user.name || 'Friend',
-          friendUniqueId: user.uniqueId,
-          roomCode: room.roomCode
-        });
-      }
+      emitToUser(invitation.sender.uniqueId, 'room_invite_accepted', {
+        friendName: user.name || 'Friend',
+        friendUniqueId: user.uniqueId,
+        roomCode: room.roomCode
+      });
     }
   });
 
@@ -881,16 +1103,21 @@ io.on('connection', (socket) => {
   });
 
   // Leave / Exit Room Flow
-  socket.on('leave_room', ({ roomId, userId }) => {
-    roomManager.leaveRoom(roomId, userId);
+  socket.on('leave_room', ({ roomId, userId, uniqueId }) => {
+    const normId = (uniqueId || socketUsers.get(socket.id) || '').trim().toUpperCase();
+    roomManager.leaveRoom(roomId, userId, normId);
     socket.leave(roomId);
+    if (normId) {
+      broadcastPresenceChange(normId);
+    }
   });
 
   socket.on('disconnect', () => {
-    const userUniqueId = socketUsers.get(socket.id);
-    if (userUniqueId) {
-      userSockets.delete(userUniqueId);
-      socketUsers.delete(socket.id);
+    const normId = socketUsers.get(socket.id);
+    roomManager.removeSocketFromMatchmaking(socket.id);
+    unregisterUserSocket(socket.id);
+    if (normId) {
+      broadcastPresenceChange(normId);
     }
     console.log(`[Socket] Disconnected: ${socket.id}`);
   });
