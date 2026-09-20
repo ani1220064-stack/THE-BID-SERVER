@@ -3,7 +3,7 @@
  * Embedded with zero external CSS dependencies for lightning-fast mobile rendering.
  */
 
-const APK_URL = "https://expo.dev/artifacts/eas/mciaysuogP_v6N-31QcP9X1P4x0WI6JbqtdQRPFidQw.apk";
+const APK_URL = "/download/THE_BID_Production_v1.0.0.apk";
 const BUILD_PAGE_URL = "https://expo.dev/accounts/aniversegames/projects/the-bid/builds/61693e70-0b3a-4b59-b6e1-169baf47d818";
 const GITHUB_REPO_URL = "https://github.com/ani1220064-stack/THE-BID-SERVER";
 

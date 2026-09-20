@@ -14,9 +14,27 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || (process.env.NODE_ENV === 'production' ? 10000 : 4000);
 
 const { getLandingPageHtml } = require('./views/landingPage');
+const path = require('path');
+const fs = require('fs');
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+
+// Direct Production APK Download Endpoints
+const APK_FILE_PATH = path.join(__dirname, '..', 'public', 'THE_BID_Production_v1.0.0.apk');
+const handleApkDownload = (req, res) => {
+  if (fs.existsSync(APK_FILE_PATH)) {
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', 'attachment; filename="THE_BID_Production_v1.0.0.apk"');
+    return res.sendFile(APK_FILE_PATH);
+  }
+  res.status(404).json({ error: 'Production APK file not found on server' });
+};
+
+app.get('/download/THE_BID_Production_v1.0.0.apk', handleApkDownload);
+app.get('/THE_BID_Production_v1.0.0.apk', handleApkDownload);
+app.get('/download/apk', handleApkDownload);
+app.get('/api/download/apk', handleApkDownload);
 
 app.get('/', (req, res) => {
   if (req.accepts('html') && !req.xhr && !req.query.json) {
