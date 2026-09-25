@@ -204,58 +204,77 @@ const db = {
     if (!targetUser) throw new Error('Player not found with THE BID ID: ' + targetBidId);
     if (targetUser.id === userId) throw new Error('Cannot send friend request to yourself');
 
+    const reqId = `freq_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    const now = Date.now();
+
     if (usePostgres && pool) {
-      const res = await pool.query(
-        `INSERT INTO friends (user_id, friend_bid_id, friend_user_id, status)
-         VALUES ($1, $2, $3, 'pending')
-         ON CONFLICT (user_id, friend_user_id) DO UPDATE SET status = 'pending'
-         RETURNING *`,
-        [userId, targetUser.bid_id, targetUser.id]
+      await pool.query(
+        `INSERT INTO friend_requests (id, sender_user_id, sender_unique_id, recipient_user_id, recipient_unique_id, status, last_sent_at)
+         VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
+         ON CONFLICT (id) DO NOTHING`,
+        [reqId, userId, (await this.getUserById(userId))?.bid_id || userId, targetUser.id, targetUser.bid_id, now]
       );
-      return res.rows[0];
+      return { targetUser, status: 'PENDING', id: reqId };
     }
 
     const store = loadLocalStore();
-    const existing = store.friends.find(f => f.user_id === userId && f.friend_user_id === targetUser.id);
-    if (existing) {
-      existing.status = 'pending';
-    } else {
-      store.friends.push({
-        id: Date.now().toString(),
-        user_id: userId,
-        friend_bid_id: targetUser.bid_id,
-        friend_user_id: targetUser.id,
-        status: 'pending',
-        created_at: new Date().toISOString()
-      });
-    }
+    store.friend_requests = store.friend_requests || [];
+    const newReq = {
+      id: reqId,
+      sender_user_id: userId,
+      sender_unique_id: store.users[userId]?.bid_id || userId,
+      recipient_user_id: targetUser.id,
+      recipient_unique_id: targetUser.bid_id,
+      status: 'PENDING',
+      created_at: new Date(now).toISOString(),
+      last_sent_at: now
+    };
+    store.friend_requests.push(newReq);
     saveLocalStore(store);
-    return { targetUser, status: 'pending' };
+    return { targetUser, status: 'PENDING', id: reqId };
   },
 
   async respondFriendRequest(userId, requestId, accept) {
-    const status = accept ? 'accepted' : 'declined';
+    const status = accept ? 'ACCEPTED' : 'DECLINED';
     if (usePostgres && pool) {
       const res = await pool.query(
-        `UPDATE friends SET status = $1 WHERE id = $2 RETURNING *`,
+        `UPDATE friend_requests SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
         [status, requestId]
       );
-      return res.rows[0];
+      const req = res.rows[0];
+      if (req && accept) {
+        // Enforce canonical user ordering for friendships table
+        const u1 = req.sender_user_id < req.recipient_user_id ? req.sender_user_id : req.recipient_user_id;
+        const u2 = req.sender_user_id < req.recipient_user_id ? req.recipient_user_id : req.sender_user_id;
+        const b1 = req.sender_user_id < req.recipient_user_id ? req.sender_unique_id : req.recipient_unique_id;
+        const b2 = req.sender_user_id < req.recipient_user_id ? req.recipient_unique_id : req.sender_unique_id;
+
+        await pool.query(
+          `INSERT INTO friendships (user_id_1, user_id_2, bid_id_1, bid_id_2)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (user_id_1, user_id_2) DO NOTHING`,
+          [u1, u2, b1, b2]
+        );
+      }
+      return req;
     }
     const store = loadLocalStore();
-    const req = store.friends.find(f => f.id === requestId);
+    store.friend_requests = store.friend_requests || [];
+    const req = store.friend_requests.find(f => f.id === requestId);
     if (req) {
       req.status = status;
-      // Also add reciprocal if accepted
+      req.updated_at = new Date().toISOString();
       if (accept) {
-        const reciprocal = store.friends.find(f => f.user_id === req.friend_user_id && f.friend_user_id === req.user_id);
-        if (!reciprocal) {
-          store.friends.push({
-            id: (Date.now() + 1).toString(),
-            user_id: req.friend_user_id,
-            friend_bid_id: store.users[req.user_id]?.bid_id,
-            friend_user_id: req.user_id,
-            status: 'accepted',
+        store.friendships = store.friendships || [];
+        const u1 = req.sender_user_id < req.recipient_user_id ? req.sender_user_id : req.recipient_user_id;
+        const u2 = req.sender_user_id < req.recipient_user_id ? req.recipient_user_id : req.sender_user_id;
+        if (!store.friendships.some(f => f.user_id_1 === u1 && f.user_id_2 === u2)) {
+          store.friendships.push({
+            id: Date.now(),
+            user_id_1: u1,
+            user_id_2: u2,
+            bid_id_1: req.sender_user_id < req.recipient_user_id ? req.sender_unique_id : req.recipient_unique_id,
+            bid_id_2: req.sender_user_id < req.recipient_user_id ? req.recipient_unique_id : req.sender_unique_id,
             created_at: new Date().toISOString()
           });
         }

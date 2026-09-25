@@ -15,6 +15,32 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Permanent mutual friendship relationship between two user accounts
+CREATE TABLE IF NOT EXISTS friendships (
+    id SERIAL PRIMARY KEY,
+    user_id_1 VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+    user_id_2 VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+    bid_id_1 VARCHAR(32) NOT NULL,
+    bid_id_2 VARCHAR(32) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_user_pair UNIQUE(user_id_1, user_id_2),
+    CONSTRAINT order_user_pair CHECK(user_id_1 < user_id_2)
+);
+
+-- Durable friend requests surviving app close, backgrounding, reconnects
+CREATE TABLE IF NOT EXISTS friend_requests (
+    id VARCHAR(64) PRIMARY KEY,
+    sender_user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+    sender_unique_id VARCHAR(32) NOT NULL,
+    recipient_user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+    recipient_unique_id VARCHAR(32) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED'
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_sent_at BIGINT
+);
+
+-- Legacy friends table compatibility view/table
 CREATE TABLE IF NOT EXISTS friends (
     id SERIAL PRIMARY KEY,
     user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
@@ -55,6 +81,7 @@ CREATE TABLE IF NOT EXISTS match_history (
     completed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Durable Room Invitations (Direct invitation path)
 CREATE TABLE IF NOT EXISTS room_invitations (
     id VARCHAR(64) PRIMARY KEY,
     sender_id VARCHAR(64),
@@ -66,12 +93,18 @@ CREATE TABLE IF NOT EXISTS room_invitations (
     room_code VARCHAR(32) NOT NULL,
     category VARCHAR(64) NOT NULL,
     category_title VARCHAR(128),
-    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED', 'EXPIRED'
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP WITH TIME ZONE
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    last_sent_at BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_bid_id ON users(bid_id);
-CREATE INDEX IF NOT EXISTS idx_friends_user_id ON friends(user_id);
+CREATE INDEX IF NOT EXISTS idx_friendships_u1 ON friendships(user_id_1);
+CREATE INDEX IF NOT EXISTS idx_friendships_u2 ON friendships(user_id_2);
+CREATE INDEX IF NOT EXISTS idx_friend_requests_recipient ON friend_requests(recipient_unique_id, status);
+CREATE INDEX IF NOT EXISTS idx_friend_requests_sender ON friend_requests(sender_unique_id, status);
 CREATE INDEX IF NOT EXISTS idx_match_history_user_id ON match_history(user_id);
-CREATE INDEX IF NOT EXISTS idx_invitations_recipient ON room_invitations(recipient_unique_id);
+CREATE INDEX IF NOT EXISTS idx_invitations_recipient ON room_invitations(recipient_unique_id, status);
+

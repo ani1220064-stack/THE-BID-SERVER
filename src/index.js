@@ -6,6 +6,7 @@ const cors = require('cors');
 require('dotenv').config();
 
 const store = require('./services/store');
+const archivalService = require('./services/archivalService');
 const RoomManager = require('./rooms/RoomManager');
 
 const app = express();
@@ -323,7 +324,8 @@ app.post('/api/auth/google', async (req, res) => {
       user: fullProfile.user,
       friends: fullProfile.friends,
       requests: fullProfile.requests,
-      history: fullProfile.history
+      history: fullProfile.history,
+      trophies: fullProfile.trophies || []
     });
   } catch (err) {
     console.error('[AUTH_ERROR] Google token verification failed:', err.message);
@@ -481,7 +483,46 @@ app.get('/api/profile/:uniqueId', (req, res) => {
     return res.status(404).json({ error: 'Player profile not found' });
   }
   const history = store.getMatchHistory(user.uniqueId || user.id);
-  res.json({ user, history });
+  const trophies = store.getTrophyLedger(user.uniqueId || user.id);
+  res.json({ user, history, trophies });
+});
+
+// Offline-First Sync Endpoint: Idempotent batch ingestion for offline matches and trophies
+app.post('/api/sync/offline-batch', (req, res) => {
+  const { uniqueId, firebaseUid, guestInstallationId, matches, trophies, profileSummary } = req.body;
+  const targetId = uniqueId || firebaseUid || guestInstallationId;
+  if (!targetId) {
+    return res.status(400).json({ error: 'Player identity is required for synchronization' });
+  }
+  const result = store.syncOfflineBatch(targetId, { matches, trophies, profileSummary });
+  if (!result) {
+    return res.status(500).json({ error: 'Sync failed' });
+  }
+  res.json({
+    success: true,
+    user: result.user,
+    history: result.history,
+    trophies: result.trophies
+  });
+});
+
+// Long-Term Disaster Recovery Archival Endpoints (Section 14)
+app.post('/api/archive/snapshot', async (req, res) => {
+  try {
+    const result = await archivalService.createSnapshotArchive(store.data);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create archive snapshot', details: err.message });
+  }
+});
+
+app.get('/api/archive/history', (req, res) => {
+  try {
+    const history = archivalService.getArchivalHistory();
+    res.json({ success: true, count: history.length, history });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to retrieve archival history', details: err.message });
+  }
 });
 
 app.post('/api/profile/update', (req, res) => {
@@ -537,15 +578,22 @@ app.post('/api/match/record', (req, res) => {
 
 // Social: Friends & Groups Endpoints (Screens 05 & 06)
 app.post('/api/friends/search', (req, res) => {
-  const { uniqueId } = req.body;
+  const { uniqueId, searcherUniqueId } = req.body;
   if (!uniqueId) return res.status(400).json({ error: 'Unique ID is required' });
   const target = store.findUserByUniqueId(uniqueId);
   if (!target) return res.status(404).json({ error: 'Player not found with that Unique ID' });
+
+  const targetUniqueId = target.uniqueId || target.id;
+  const relationship = searcherUniqueId 
+    ? store.getPlayerRelationship(searcherUniqueId, targetUniqueId)
+    : 'NOT_FRIENDS';
+
   res.json({
-    uniqueId: target.uniqueId,
+    uniqueId: targetUniqueId,
     name: target.name,
     avatar: target.avatar,
-    trophies: target.trophies || 0
+    trophies: target.trophies || 0,
+    relationship
   });
 });
 
@@ -554,25 +602,54 @@ app.post('/api/friends/request', (req, res) => {
   const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
 
   if (result.success && !result.autoAccepted && result.request) {
+    console.log('[FRIEND_REQUEST_CREATED]', JSON.stringify({
+      requestId: result.request.id,
+      senderUserId: result.request.senderUserId || fromUniqueId,
+      senderUniqueId: fromUniqueId,
+      recipientUserId: result.request.recipientUserId || toUniqueId,
+      recipientUniqueId: toUniqueId,
+      timestamp: Date.now()
+    }));
+
     // Emit real-time notification immediately to recipient's active socket(s)
-    emitToUser(toUniqueId, 'friend_request_received', {
+    const payload = {
       id: result.request.id,
+      requestId: result.request.id,
       fromUniqueId: result.request.fromUniqueId,
       fromName: result.request.fromName,
       fromAvatar: result.request.fromAvatar,
       trophies: result.fromUser ? (result.fromUser.trophies || 0) : 0,
       timestamp: Date.now(),
       reNotified: !!result.reNotified
-    });
+    };
+    emitToUser(toUniqueId, 'friend_request_created', payload);
+    emitToUser(toUniqueId, 'friend_request_received', payload);
+    console.log('[FRIEND_REQUEST_DELIVERED_SOCKET]', JSON.stringify({
+      requestId: result.request.id,
+      recipientUniqueId: toUniqueId,
+      timestamp: Date.now()
+    }));
   } else if (result.success && result.autoAccepted) {
-    emitToUser(toUniqueId, 'friend_request_accepted', {
+    console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
+      senderUniqueId: fromUniqueId,
+      recipientUniqueId: toUniqueId,
+      autoAccepted: true,
+      timestamp: Date.now()
+    }));
+    const payload1 = {
       friendUniqueId: fromUniqueId,
-      friendName: result.fromUser ? result.fromUser.name : fromUniqueId
-    });
-    emitToUser(fromUniqueId, 'friend_request_accepted', {
+      friendName: result.fromUser ? result.fromUser.name : fromUniqueId,
+      relationship: 'FRIENDS'
+    };
+    const payload2 = {
       friendUniqueId: toUniqueId,
-      friendName: result.targetUser ? result.targetUser.name : toUniqueId
-    });
+      friendName: result.targetUser ? result.targetUser.name : toUniqueId,
+      relationship: 'FRIENDS'
+    };
+    emitToUser(toUniqueId, 'friendship_created', payload1);
+    emitToUser(toUniqueId, 'friend_request_accepted', payload1);
+    emitToUser(fromUniqueId, 'friendship_created', payload2);
+    emitToUser(fromUniqueId, 'friend_request_accepted', payload2);
   }
 
   res.json(result);
@@ -582,14 +659,25 @@ app.post('/api/friends/accept', (req, res) => {
   const { userUniqueId, fromUniqueId } = req.body;
   const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
   if (result.success) {
-    emitToUser(fromUniqueId, 'friend_request_accepted', {
+    console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
+      userUniqueId,
+      fromUniqueId,
+      timestamp: Date.now()
+    }));
+    const payload1 = {
       friendUniqueId: userUniqueId,
-      friendName: result.user ? result.user.name : userUniqueId
-    });
-    emitToUser(userUniqueId, 'friend_request_accepted', {
+      friendName: result.user ? result.user.name : userUniqueId,
+      relationship: 'FRIENDS'
+    };
+    const payload2 = {
       friendUniqueId: fromUniqueId,
-      friendName: result.fromUser ? result.fromUser.name : fromUniqueId
-    });
+      friendName: result.fromUser ? result.fromUser.name : fromUniqueId,
+      relationship: 'FRIENDS'
+    };
+    emitToUser(fromUniqueId, 'friendship_created', payload1);
+    emitToUser(fromUniqueId, 'friend_request_accepted', payload1);
+    emitToUser(userUniqueId, 'friendship_created', payload2);
+    emitToUser(userUniqueId, 'friend_request_accepted', payload2);
   }
   res.json(result);
 });
@@ -598,6 +686,11 @@ app.post('/api/friends/decline', (req, res) => {
   const { userUniqueId, fromUniqueId } = req.body;
   const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
   if (result.success) {
+    console.log('[FRIEND_REQUEST_DECLINED]', JSON.stringify({
+      userUniqueId,
+      fromUniqueId,
+      timestamp: Date.now()
+    }));
     emitToUser(fromUniqueId, 'friend_request_declined', {
       friendUniqueId: userUniqueId
     });
@@ -644,6 +737,35 @@ app.get('/api/invitations/:uniqueId', (req, res) => {
   }
   const invitations = store.getPendingInvitations(reqId);
   res.json({ invitations });
+});
+
+// Custom Entities REST Endpoints
+app.get('/api/custom-entities/:uniqueId', (req, res) => {
+  const reqId = req.params.uniqueId;
+  const categoryId = req.query.category;
+  if (!reqId || typeof reqId !== 'string') {
+    return res.status(400).json({ error: 'Invalid Player ID' });
+  }
+  const customEntities = store.getCustomEntities(reqId, categoryId);
+  res.json({ success: true, customEntities });
+});
+
+app.post('/api/custom-entities/create', (req, res) => {
+  const { ownerUniqueId, categoryId, name, entityType } = req.body;
+  if (!ownerUniqueId || !name || !categoryId) {
+    return res.status(400).json({ error: 'Owner, category, and name are required' });
+  }
+  const result = store.createCustomEntity({ ownerUniqueId, categoryId, name, entityType });
+  res.json(result);
+});
+
+app.post('/api/custom-entities/delete', (req, res) => {
+  const { customEntityId, ownerUniqueId } = req.body;
+  if (!customEntityId || !ownerUniqueId) {
+    return res.status(400).json({ error: 'Entity ID and owner ID are required' });
+  }
+  const result = store.deleteCustomEntity(customEntityId, ownerUniqueId);
+  res.json(result);
 });
 
 // Testing Support Endpoints (Isolated for Multiplayer Simulation & Automated Teardown)
@@ -770,25 +892,57 @@ io.on('connection', (socket) => {
   socket.on('send_friend_request', ({ fromUniqueId, toUniqueId }) => {
     const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
     if (result.success && !result.autoAccepted && result.request) {
-      emitToUser(toUniqueId, 'friend_request_received', {
+      console.log('[FRIEND_REQUEST_CREATED]', JSON.stringify({
+        requestId: result.request.id,
+        senderUserId: result.request.senderUserId || fromUniqueId,
+        senderUniqueId: fromUniqueId,
+        recipientUserId: result.request.recipientUserId || toUniqueId,
+        recipientUniqueId: toUniqueId,
+        timestamp: Date.now()
+      }));
+
+      const payload = {
         id: result.request.id,
+        requestId: result.request.id,
         fromUniqueId: result.request.fromUniqueId,
         fromName: result.request.fromName,
         fromAvatar: result.request.fromAvatar,
         trophies: result.fromUser ? (result.fromUser.trophies || 0) : 0,
         timestamp: Date.now(),
         reNotified: !!result.reNotified
-      });
+      };
+      emitToUser(toUniqueId, 'friend_request_created', payload);
+      emitToUser(toUniqueId, 'friend_request_received', payload);
+      console.log('[FRIEND_REQUEST_DELIVERED_SOCKET]', JSON.stringify({
+        requestId: result.request.id,
+        recipientUniqueId: toUniqueId,
+        timestamp: Date.now()
+      }));
+
       socket.emit('friend_request_sent', { toUniqueId, reNotified: !!result.reNotified });
     } else if (result.success && result.autoAccepted) {
-      emitToUser(toUniqueId, 'friend_request_accepted', {
+      console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
+        senderUniqueId: fromUniqueId,
+        recipientUniqueId: toUniqueId,
+        autoAccepted: true,
+        timestamp: Date.now()
+      }));
+
+      const payload1 = {
         friendUniqueId: fromUniqueId,
-        friendName: result.fromUser ? result.fromUser.name : fromUniqueId
-      });
-      emitToUser(fromUniqueId, 'friend_request_accepted', {
+        friendName: result.fromUser ? result.fromUser.name : fromUniqueId,
+        relationship: 'FRIENDS'
+      };
+      const payload2 = {
         friendUniqueId: toUniqueId,
-        friendName: result.targetUser ? result.targetUser.name : toUniqueId
-      });
+        friendName: result.targetUser ? result.targetUser.name : toUniqueId,
+        relationship: 'FRIENDS'
+      };
+
+      emitToUser(toUniqueId, 'friendship_created', payload1);
+      emitToUser(toUniqueId, 'friend_request_accepted', payload1);
+      emitToUser(fromUniqueId, 'friendship_created', payload2);
+      emitToUser(fromUniqueId, 'friend_request_accepted', payload2);
     } else {
       socket.emit('friend_request_error', { message: result.message || 'Could not send friend request' });
     }
@@ -798,18 +952,36 @@ io.on('connection', (socket) => {
     if (accept) {
       const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
       if (result.success) {
-        emitToUser(fromUniqueId, 'friend_request_accepted', {
+        console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
+          userUniqueId,
+          fromUniqueId,
+          timestamp: Date.now()
+        }));
+
+        const payload1 = {
           friendUniqueId: userUniqueId,
-          friendName: result.user ? result.user.name : userUniqueId
-        });
-        emitToUser(userUniqueId, 'friend_request_accepted', {
+          friendName: result.user ? result.user.name : userUniqueId,
+          relationship: 'FRIENDS'
+        };
+        const payload2 = {
           friendUniqueId: fromUniqueId,
-          friendName: result.fromUser ? result.fromUser.name : fromUniqueId
-        });
+          friendName: result.fromUser ? result.fromUser.name : fromUniqueId,
+          relationship: 'FRIENDS'
+        };
+
+        emitToUser(fromUniqueId, 'friendship_created', payload1);
+        emitToUser(fromUniqueId, 'friend_request_accepted', payload1);
+        emitToUser(userUniqueId, 'friendship_created', payload2);
+        emitToUser(userUniqueId, 'friend_request_accepted', payload2);
       }
     } else {
       const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
       if (result.success) {
+        console.log('[FRIEND_REQUEST_DECLINED]', JSON.stringify({
+          userUniqueId,
+          fromUniqueId,
+          timestamp: Date.now()
+        }));
         emitToUser(fromUniqueId, 'friend_request_declined', {
           friendUniqueId: userUniqueId
         });
@@ -927,25 +1099,68 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const normFriend = friendUniqueId.trim().toUpperCase();
+    const senderUniqueId = (user.uniqueId || user.id).trim().toUpperCase();
+
+    // Verification 1: Verify sender and recipient are permanent friends
+    if (!store.areFriends(senderUniqueId, normFriend)) {
+      socket.emit('error_message', { message: 'Player must be on your friend list to receive a direct invitation.' });
+      return;
+    }
+
+    // Verification 2: Verify room is joinable
+    if (room.state !== 'LOBBY' && room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION') {
+      socket.emit('error_message', { message: 'This auction has already begun and cannot accept new players.' });
+      return;
+    }
+
+    // Verification 3: Verify recipient is not already inside this room
+    const alreadyInRoom = Array.from(room.participants.values()).some(p => p.uniqueId && p.uniqueId.toUpperCase() === normFriend);
+    if (alreadyInRoom) {
+      socket.emit('error_message', { message: 'Player is already inside this room.' });
+      return;
+    }
+
+    // Verification 4: Verify recipient is not BUSY inside another room
+    const friendActiveRoom = roomManager.isUserInActiveMatch(null, normFriend);
+    if (friendActiveRoom && friendActiveRoom.id !== room.id && friendActiveRoom.state !== 'RESULTS') {
+      socket.emit('error_message', { message: 'Friend is currently busy in another match.' });
+      return;
+    }
+
     const inviteResult = store.createOrUpdateInvitation({
       sender: user,
-      recipientUniqueId: friendUniqueId,
+      recipientUniqueId: normFriend,
       roomId: room.id,
       roomCode: room.roomCode || room.id,
       category: room.category,
       categoryTitle: room.categoryConfig?.title || 'Auction Room'
     });
 
+    console.log('[ROOM_INVITE_CREATED]', JSON.stringify({
+      invitationId: inviteResult.invitation.id,
+      senderUserId: user.id,
+      senderUniqueId,
+      recipientUniqueId: normFriend,
+      roomId: room.id,
+      timestamp: Date.now()
+    }));
+
     // Notify host that invite was created/refreshed
     socket.emit('room_invite_sent', {
-      friendUniqueId,
+      friendUniqueId: normFriend,
       invitationId: inviteResult.invitation.id,
       isDuplicate: inviteResult.isDuplicate,
       reNotified: !!inviteResult.reNotified
     });
 
-    // If friend is online, send real-time notification to all active sockets
-    emitToUser(friendUniqueId, 'room_invitation_received', inviteResult.invitation);
+    // Deliver real-time notification to all active sockets of the friend
+    emitToUser(normFriend, 'room_invitation_received', inviteResult.invitation);
+    console.log('[ROOM_INVITE_DELIVERED_SOCKET]', JSON.stringify({
+      invitationId: inviteResult.invitation.id,
+      recipientUniqueId: normFriend,
+      timestamp: Date.now()
+    }));
   });
 
   socket.on('respond_room_invite', ({ invitationId, response, user }) => {
@@ -957,8 +1172,16 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const userUniqueId = (user.uniqueId || user.id).trim().toUpperCase();
+
     if (response === 'DECLINED') {
       store.updateInvitationStatus(invitationId, 'DECLINED');
+      console.log('[ROOM_INVITE_DECLINED]', JSON.stringify({
+        invitationId,
+        userUniqueId,
+        roomId: invitation.roomId,
+        timestamp: Date.now()
+      }));
       emitToUser(invitation.sender.uniqueId, 'room_invite_declined', {
         friendName: user.name || 'Friend',
         friendUniqueId: user.uniqueId,
@@ -969,10 +1192,38 @@ io.on('connection', (socket) => {
     }
 
     if (response === 'ACCEPTED') {
+      // Atomic Verification:
+      // 1. Verify recipient identity matches invitation recipient
+      if (invitation.recipientUniqueId.toUpperCase() !== userUniqueId) {
+        socket.emit('error_message', { message: 'This invitation was not addressed to you.' });
+        return;
+      }
+
+      // 2. Verify room exists
       const room = roomManager.getRoom(invitation.roomId);
       if (!room) {
         store.updateInvitationStatus(invitationId, 'EXPIRED');
         socket.emit('error_message', { message: 'The room has expired or been closed.' });
+        return;
+      }
+
+      // 3. Verify room joinability
+      if (room.state !== 'LOBBY' && room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION') {
+        socket.emit('error_message', { message: 'The auction has already started and cannot be joined.' });
+        return;
+      }
+
+      // 4. Verify room capacity
+      const humanCount = Array.from(room.participants.values()).filter(p => !p.isAI).length;
+      if (humanCount >= 10) {
+        socket.emit('error_message', { message: 'Room has reached maximum capacity.' });
+        return;
+      }
+
+      // 5. Verify recipient isn't already inside another active match
+      const otherMatch = roomManager.isUserInActiveMatch(user.id, userUniqueId);
+      if (otherMatch && otherMatch.id !== room.id && otherMatch.state !== 'RESULTS') {
+        socket.emit('error_message', { message: 'You are currently participating in another auction room.' });
         return;
       }
 
@@ -984,6 +1235,13 @@ io.on('connection', (socket) => {
       }
 
       store.updateInvitationStatus(invitationId, 'ACCEPTED');
+      console.log('[ROOM_INVITE_ACCEPTED]', JSON.stringify({
+        invitationId,
+        userUniqueId,
+        roomId: room.id,
+        timestamp: Date.now()
+      }));
+
       socket.join(room.id);
       socket.emit('room_joined', {
         roomId: room.id,
@@ -991,6 +1249,7 @@ io.on('connection', (socket) => {
         category: room.category
       });
       roomManager.broadcastRoomState(joinResult.room);
+      broadcastPresenceChange(userUniqueId);
 
       emitToUser(invitation.sender.uniqueId, 'room_invite_accepted', {
         friendName: user.name || 'Friend',
@@ -1043,14 +1302,17 @@ io.on('connection', (socket) => {
   socket.on('setup_complete', handleSetupComplete);
   socket.on('confirm_setup', handleSetupComplete);
 
-  // Pre-Auction Lobby (Screen 14) & Real-Time IPL Team Selection
-  socket.on('select_team', ({ roomId, userId, teamId }) => {
-    const result = roomManager.selectTeam(roomId, userId, teamId, { callerSocketId: socket.id });
+  // Pre-Auction Lobby & Real-Time Universal Team / Studio Selection
+  const handleSelectTeam = ({ roomId, userId, teamId, movieTitle }) => {
+    const result = roomManager.selectTeam(roomId, userId, teamId, { callerSocketId: socket.id, movieTitle });
     if (!result.success) {
       socket.emit('team_select_error', { message: result.message, teamId });
       socket.emit('error_message', { message: result.message });
     }
-  });
+  };
+
+  socket.on('select_team', handleSelectTeam);
+  socket.on('select_entity', handleSelectTeam);
 
   socket.on('toggle_ready', ({ roomId, userId, teamName }) => {
     roomManager.toggleReady(roomId, userId, teamName);
@@ -1102,6 +1364,23 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Universal FINISH AUCTION Consensus System (Parallel Voting)
+  socket.on('request_finish_auction', ({ roomId, userId }) => {
+    if (!roomId || !userId) return;
+    const result = roomManager.requestFinishAuction(roomId, userId);
+    if (!result.success) {
+      socket.emit('error_message', { message: result.message });
+    }
+  });
+
+  socket.on('vote_finish_auction', ({ roomId, userId, agreed }) => {
+    if (!roomId || !userId) return;
+    const result = roomManager.voteFinishAuction(roomId, userId, !!agreed);
+    if (!result.success) {
+      socket.emit('error_message', { message: result.message });
+    }
+  });
+
   // Leave / Exit Room Flow
   socket.on('leave_room', ({ roomId, userId, uniqueId }) => {
     const normId = (uniqueId || socketUsers.get(socket.id) || '').trim().toUpperCase();
@@ -1115,6 +1394,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const normId = socketUsers.get(socket.id);
     roomManager.removeSocketFromMatchmaking(socket.id);
+    roomManager.handleSocketDisconnect(socket.id);
     unregisterUserSocket(socket.id);
     if (normId) {
       broadcastPresenceChange(normId);

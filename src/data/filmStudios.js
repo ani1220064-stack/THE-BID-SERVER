@@ -1,13 +1,119 @@
-// Canonical definition of the 10 Major Film Studios (Global & Indian Giants)
-// In Movie Stars auction, each participant represents and owns a film studio (NO teams).
+// Canonical definition of the 20 Curated Major Film Studios (50% Indian Giants & 50% Global Titans)
+// In Movie Stars auction, each participant represents and owns a film studio/production house.
+
 const FILM_STUDIOS = [
+  // --- INDIAN GIANTS (10) ---
+  {
+    id: 'yrf',
+    code: 'YRF',
+    name: 'Yash Raj Films',
+    shortName: 'Yash Raj Films',
+    primaryColor: '#D32F2F',
+    badge: '👑',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'dhr',
+    code: 'DHR',
+    name: 'Dharma Productions',
+    shortName: 'Dharma',
+    primaryColor: '#6A1B9A',
+    badge: '✨',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'tseries',
+    code: 'TSER',
+    name: 'T-Series Films',
+    shortName: 'T-Series',
+    primaryColor: '#E53935',
+    badge: '🎵',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'red_chillies',
+    code: 'RCE',
+    name: 'Red Chillies Entertainment',
+    shortName: 'Red Chillies',
+    primaryColor: '#C2185B',
+    badge: '🌶️',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'jio_studios',
+    code: 'JIO',
+    name: 'Jio Studios',
+    shortName: 'Jio Studios',
+    primaryColor: '#1976D2',
+    badge: '📱',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'hombale',
+    code: 'HOM',
+    name: 'Hombale Films',
+    shortName: 'Hombale',
+    primaryColor: '#F57C00',
+    badge: '🔥',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'excel',
+    code: 'EXC',
+    name: 'Excel Entertainment',
+    shortName: 'Excel',
+    primaryColor: '#0288D1',
+    badge: '⭐',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'maddock',
+    code: 'MAD',
+    name: 'Maddock Films',
+    shortName: 'Maddock',
+    primaryColor: '#388E3C',
+    badge: '🎬',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'rajshri',
+    code: 'RAJ',
+    name: 'Rajshri Productions',
+    shortName: 'Rajshri',
+    primaryColor: '#7B1FA2',
+    badge: '🕊️',
+    featured: true,
+    region: 'Indian'
+  },
+  {
+    id: 'nadiadwala',
+    code: 'NGE',
+    name: 'Nadiadwala Grandson Entertainment',
+    shortName: 'Nadiadwala',
+    primaryColor: '#D81B60',
+    badge: '🌟',
+    featured: true,
+    region: 'Indian'
+  },
+
+  // --- GLOBAL TITANS (10) ---
   {
     id: 'disney',
     code: 'DIS',
-    name: 'Walt Disney Studios',
+    name: 'Walt Disney Pictures',
     shortName: 'Disney',
     primaryColor: '#002244',
-    badge: '🏰'
+    badge: '🏰',
+    featured: true,
+    region: 'Global'
   },
   {
     id: 'warner_bros',
@@ -15,7 +121,9 @@ const FILM_STUDIOS = [
     name: 'Warner Bros. Pictures',
     shortName: 'Warner Bros.',
     primaryColor: '#003399',
-    badge: '🛡️'
+    badge: '🛡️',
+    featured: true,
+    region: 'Global'
   },
   {
     id: 'universal',
@@ -23,7 +131,9 @@ const FILM_STUDIOS = [
     name: 'Universal Pictures',
     shortName: 'Universal',
     primaryColor: '#1A1A24',
-    badge: '🌐'
+    badge: '🌐',
+    featured: true,
+    region: 'Global'
   },
   {
     id: 'sony_pictures',
@@ -31,15 +141,9 @@ const FILM_STUDIOS = [
     name: 'Sony Pictures',
     shortName: 'Sony',
     primaryColor: '#0A0A0A',
-    badge: '📽️'
-  },
-  {
-    id: 'marvel_studios',
-    code: 'MCU',
-    name: 'Marvel Studios',
-    shortName: 'Marvel',
-    primaryColor: '#ED1D24',
-    badge: '⚡'
+    badge: '📽️',
+    featured: true,
+    region: 'Global'
   },
   {
     id: 'paramount',
@@ -47,7 +151,9 @@ const FILM_STUDIOS = [
     name: 'Paramount Pictures',
     shortName: 'Paramount',
     primaryColor: '#004A97',
-    badge: '⛰️'
+    badge: '⛰️',
+    featured: true,
+    region: 'Global'
   },
   {
     id: 'twentieth_century',
@@ -55,23 +161,9 @@ const FILM_STUDIOS = [
     name: '20th Century Studios',
     shortName: '20th Century',
     primaryColor: '#C9A45C',
-    badge: '🏛️'
-  },
-  {
-    id: 'yash_raj_films',
-    code: 'YRF',
-    name: 'Yash Raj Films',
-    shortName: 'Yash Raj Films',
-    primaryColor: '#D32F2F',
-    badge: '👑'
-  },
-  {
-    id: 'dharma_productions',
-    code: 'DHR',
-    name: 'Dharma Productions',
-    shortName: 'Dharma Productions',
-    primaryColor: '#6A1B9A',
-    badge: '✨'
+    badge: '🏛️',
+    featured: true,
+    region: 'Global'
   },
   {
     id: 'lionsgate',
@@ -79,7 +171,39 @@ const FILM_STUDIOS = [
     name: 'Lionsgate Films',
     shortName: 'Lionsgate',
     primaryColor: '#C59B27',
-    badge: '🦁'
+    badge: '🦁',
+    featured: true,
+    region: 'Global'
+  },
+  {
+    id: 'a24',
+    code: 'A24',
+    name: 'A24',
+    shortName: 'A24',
+    primaryColor: '#000000',
+    badge: '🎞️',
+    featured: true,
+    region: 'Global'
+  },
+  {
+    id: 'mgm',
+    code: 'MGM',
+    name: 'Metro-Goldwyn-Mayer',
+    shortName: 'MGM',
+    primaryColor: '#D4AF37',
+    badge: '🦁',
+    featured: true,
+    region: 'Global'
+  },
+  {
+    id: 'united_artists',
+    code: 'UA',
+    name: 'United Artists',
+    shortName: 'United Artists',
+    primaryColor: '#333333',
+    badge: '🎨',
+    featured: true,
+    region: 'Global'
   }
 ];
 
@@ -104,9 +228,14 @@ function getAllFilmStudios() {
   return [...FILM_STUDIOS];
 }
 
+function getFeaturedFilmStudios() {
+  return FILM_STUDIOS.filter(s => s.featured);
+}
+
 module.exports = {
   FILM_STUDIOS,
   getFilmStudioById,
   getFilmStudioByName,
-  getAllFilmStudios
+  getAllFilmStudios,
+  getFeaturedFilmStudios
 };

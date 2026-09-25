@@ -2,15 +2,30 @@ const { CategoryRegistry } = require('../categories/CategoryRegistry');
 const { AuctionBot, generateFictionalBots, DEFAULT_AI_PROFILES, getGenderForName, getBotAvatarForName } = require('../ai/AuctionBot');
 const store = require('../services/store');
 
-function getCategoryFranchise(catMod, idOrName) {
-  if (!idOrName || !catMod) return null;
+function getCategoryFranchise(catMod, idOrName, ownerUniqueId) {
+  if (!idOrName) return null;
+  const clean = String(idOrName).trim();
+
+  // 1. Check if idOrName references a user-owned custom entity
+  if (ownerUniqueId && store.getCustomEntities) {
+    const userCustoms = store.getCustomEntities(ownerUniqueId, catMod ? catMod.id : null);
+    const customMatch = userCustoms.find(c => 
+      c.id === clean || 
+      c.customEntityId === clean || 
+      c.name.toLowerCase() === clean.toLowerCase()
+    );
+    if (customMatch) return { ...customMatch, isCustom: true };
+  }
+
+  // 2. Check official category module
+  if (!catMod) return null;
   if (catMod.getFranchiseById) {
-    const f = catMod.getFranchiseById(idOrName);
-    if (f) return f;
+    const f = catMod.getFranchiseById(clean);
+    if (f) return { ...f, isOfficial: true };
   }
   if (catMod.getFranchiseByName) {
-    const f = catMod.getFranchiseByName(idOrName);
-    if (f) return f;
+    const f = catMod.getFranchiseByName(clean);
+    if (f) return { ...f, isOfficial: true };
   }
   return null;
 }
@@ -138,7 +153,10 @@ class RoomManager {
       timerInterval: null,
       lotTimeout: null,
       aiBidTimeout: null,
+      pauseTimeout: null,
       isResolvingLot: false,
+      finishVoteState: 'NORMAL', // 'NORMAL' | 'FINISH_REQUESTED' | 'FINISH_REJECTED' | 'FINISH_APPROVED'
+      finishVote: null, // { requestedBy, requesterName, votes: {}, totalRequired, agreedCount }
       reactions: [],
       createdAt: Date.now()
     };
@@ -147,16 +165,17 @@ class RoomManager {
 
     // Slot #1 is always Host ("Me") — permanently locked & cannot be removed
     let hostFranchise = null;
+    const hostUniqueId = hostUser ? (hostUser.uniqueId || hostUser.bidId || hostUser.id) : null;
     if (Array.isArray(customParticipants)) {
       const hostCustom = customParticipants.find(p => p.id === hostUser.id || p.type === 'HOST');
       if (hostCustom && (hostCustom.teamId || hostCustom.teamName)) {
-        hostFranchise = getCategoryFranchise(categoryModule, hostCustom.teamId) || 
-                        getCategoryFranchise(categoryModule, hostCustom.teamName);
+        hostFranchise = getCategoryFranchise(categoryModule, hostCustom.teamId, hostUniqueId) || 
+                        getCategoryFranchise(categoryModule, hostCustom.teamName, hostUniqueId);
       }
     }
-    if (!hostFranchise) {
-      hostFranchise = getCategoryFranchise(categoryModule, hostUser.teamId) || 
-                      getCategoryFranchise(categoryModule, hostUser.teamName) || 
+    if (!hostFranchise && hostUser) {
+      hostFranchise = getCategoryFranchise(categoryModule, hostUser.teamId, hostUniqueId) || 
+                      getCategoryFranchise(categoryModule, hostUser.teamName, hostUniqueId) || 
                       categoryFranchises[0];
     }
     if (hostFranchise) {
@@ -174,6 +193,7 @@ class RoomManager {
       avatar: hostUser.avatar,
       teamId: hostFranchise ? hostFranchise.id : null,
       teamName: hostFranchise ? hostFranchise.name : (hostUser.teamName || 'Host Team'),
+      isCustom: Boolean(hostFranchise && hostFranchise.isCustom),
       purse: room.proposedBudget,
       startingBudget: room.proposedBudget,
       squad: [],
@@ -557,6 +577,17 @@ class RoomManager {
       store.cancelInvitationsForRoom(roomId);
       this.rooms.delete(roomId);
 
+      // Notify presence change for all human participants in the room
+      for (const p of room.participants.values()) {
+        if (!p.isAI && p.uniqueId) {
+          const normU = p.uniqueId.trim().toUpperCase();
+          this.userLifecycle.set(normU, 'AVAILABLE');
+          if (this.onPresenceChanged) {
+            this.onPresenceChanged(normU);
+          }
+        }
+      }
+
       // Notify any remaining sockets in the room that room has closed
       this.io.to(roomId).emit('room_closed', {
         roomId,
@@ -565,6 +596,29 @@ class RoomManager {
       console.log(`[RoomManager] Room ${roomId} closed and cleaned up.`);
       return { success: true, roomClosed: true };
     } else {
+      // If a finish auction request is currently pending, update voting tally
+      if (room.finishVoteState === 'FINISH_REQUESTED' && room.finishVote) {
+        if (leavingParticipant.isAI) {
+          // Converted to bot: AI bots auto-agree to finish requests
+          room.finishVote.votes[participantId] = true;
+        } else {
+          delete room.finishVote.votes[participantId];
+        }
+
+        const eligible = this.getActiveEligibleParticipants(room);
+        const eligibleIds = eligible.map(e => e.id);
+        room.finishVote.eligibleParticipantIds = eligibleIds;
+        room.finishVote.totalRequired = eligibleIds.length;
+        const agreedCount = eligibleIds.filter(id => room.finishVote.votes[id] === true).length;
+        room.finishVote.agreedCount = agreedCount;
+
+        // If remaining participants now reach 100% agreement
+        if (agreedCount >= room.finishVote.totalRequired && room.finishVote.totalRequired > 0) {
+          this.resolveAndFinishAuction(room);
+          return { success: true, roomClosed: false, room };
+        }
+      }
+
       // Room continues with remaining participants: broadcast updated room state
       this.broadcastRoomState(room);
       return { success: true, roomClosed: false, room };
@@ -765,10 +819,10 @@ class RoomManager {
     this.broadcastRoomState(room);
   }
 
-  // Handle Starting Budget Negotiation (Screens 12 & 13)
+  // Handle Starting Budget Negotiation (Screens 12 & 13 & Lobby Re-negotiation)
   proposeBudget(roomId, userId, newBudget) {
     const room = this.rooms.get(roomId);
-    if (!room || (room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION')) return;
+    if (!room || (room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION' && room.state !== 'LOBBY')) return;
 
     // Security Hardening: Validate proposed budget within legitimate bounds
     const budget = Math.round(Number(newBudget) * 10) / 10;
@@ -777,21 +831,21 @@ class RoomManager {
     }
 
     room.proposedBudget = budget;
+    room.state = 'BUDGET_SELECTION';
+    room.budgetVotes.clear();
+    room.budgetVotes.set(userId, true); // Proposer votes agree
+    room.bots.forEach(b => room.budgetVotes.set(b.id, true));
+
     room.participants.forEach(p => {
       p.purse = room.proposedBudget;
       p.startingBudget = room.proposedBudget;
+      p.isReady = false; // Reset ready states when budget is renegotiated
     });
 
-    if (room.state === 'BUDGET_SELECTION') {
-      room.budgetVotes.clear();
-      room.budgetVotes.set(userId, true); // Proposer votes agree
-      room.bots.forEach(b => room.budgetVotes.set(b.id, true));
-
-      // Check if unanimous agreement reached
-      const allAgreed = Array.from(room.participants.keys()).every(id => room.budgetVotes.get(id) === true);
-      if (allAgreed) {
-        room.state = 'LOBBY';
-      }
+    // Check if unanimous agreement reached (e.g. 1-player room or only bots)
+    const allAgreed = Array.from(room.participants.keys()).every(id => room.budgetVotes.get(id) === true);
+    if (allAgreed) {
+      room.state = 'LOBBY';
     }
 
     this.broadcastRoomState(room);
@@ -1022,6 +1076,7 @@ class RoomManager {
 
   // Real-time server-authoritative team selection (Screen 14 Lobby & Team Selection)
   selectTeam(roomId, userId, teamId, options = {}) {
+    const opts = typeof options === 'string' ? { movieTitle: options } : (options || {});
     const room = this.rooms.get(roomId);
     if (!room) return { success: false, message: 'Room not found.' };
     if (room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION' && room.state !== 'LOBBY') {
@@ -1039,7 +1094,8 @@ class RoomManager {
     }
 
     const categoryModule = CategoryRegistry.get(room.category);
-    const franchise = getCategoryFranchise(categoryModule, teamId);
+    const userUniqueId = participant?.uniqueId || userId;
+    const franchise = getCategoryFranchise(categoryModule, teamId, userUniqueId);
     if (!franchise) {
       return { success: false, message: 'Invalid team or franchise selected.' };
     }
@@ -1048,36 +1104,39 @@ class RoomManager {
       room.teamOwnership = new Map();
     }
 
-    // Check if team is already owned by another participant in this room
-    const currentOwnerId = room.teamOwnership.get(franchise.id);
-    if (currentOwnerId && currentOwnerId !== userId) {
-      const ownerParticipant = room.participants.get(currentOwnerId);
-      if (ownerParticipant && ownerParticipant.isAI) {
-        // Human is sovereign: AI bot yields and reassigns to an unowned franchise
-        const categoryFranchises = categoryModule.getFranchises ? categoryModule.getFranchises() : (categoryModule.franchises || []);
-        const unowned = categoryFranchises.find(f => f.id !== franchise.id && !room.teamOwnership.has(f.id));
-        if (unowned) {
-          room.teamOwnership.set(unowned.id, currentOwnerId);
-          ownerParticipant.teamId = unowned.id;
-          ownerParticipant.teamName = unowned.name;
-          const botObj = room.bots.find(b => b.id === currentOwnerId);
-          if (botObj) {
-            botObj.teamId = unowned.id;
-            botObj.teamName = unowned.name;
+    // Official entities require strict 1-participant-per-room reservation
+    // Custom entities are identified by instance id (e.g. custom_xxx) and private to creator
+    if (!franchise.isCustom) {
+      const currentOwnerId = room.teamOwnership.get(franchise.id);
+      if (currentOwnerId && currentOwnerId !== userId) {
+        const ownerParticipant = room.participants.get(currentOwnerId);
+        if (ownerParticipant && ownerParticipant.isAI) {
+          // Human is sovereign: AI bot yields and reassigns to an unowned franchise
+          const categoryFranchises = categoryModule.getFranchises ? categoryModule.getFranchises() : (categoryModule.franchises || []);
+          const unowned = categoryFranchises.find(f => f.id !== franchise.id && !room.teamOwnership.has(f.id));
+          if (unowned) {
+            room.teamOwnership.set(unowned.id, currentOwnerId);
+            ownerParticipant.teamId = unowned.id;
+            ownerParticipant.teamName = unowned.name;
+            const botObj = room.bots.find(b => b.id === currentOwnerId);
+            if (botObj) {
+              botObj.teamId = unowned.id;
+              botObj.teamName = unowned.name;
+            }
+          } else {
+            room.teamOwnership.delete(franchise.id);
           }
         } else {
-          room.teamOwnership.delete(franchise.id);
+          const ownerName = ownerParticipant ? ownerParticipant.name : 'Another player';
+          return {
+            success: false,
+            message: `${franchise.name} (${franchise.code}) has already been selected by ${ownerName}. Please choose another team.`
+          };
         }
-      } else {
-        const ownerName = ownerParticipant ? ownerParticipant.name : 'Another player';
-        return {
-          success: false,
-          message: `${franchise.name} (${franchise.code}) has already been selected by ${ownerName}. Please choose another team.`
-        };
       }
     }
 
-    // Release any previous team owned by this user
+    // Release any previous official team owned by this user
     for (const [tId, uId] of room.teamOwnership.entries()) {
       if (uId === userId) {
         room.teamOwnership.delete(tId);
@@ -1091,6 +1150,10 @@ class RoomManager {
     if (participant) {
       participant.teamId = franchise.id;
       participant.teamName = franchise.name;
+      participant.isCustom = !!franchise.isCustom;
+      if (opts.movieTitle && typeof opts.movieTitle === 'string') {
+        participant.movieTitle = opts.movieTitle.trim().slice(0, 80);
+      }
     }
 
     this.broadcastRoomState(room);
@@ -1547,7 +1610,8 @@ class RoomManager {
 
     // 3.5s pause to celebrate/absorb SOLD/UNSOLD moment before next player
     const pauseDuration = room.pauseDurationMs || 3500;
-    setTimeout(() => {
+    if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
+    room.pauseTimeout = setTimeout(() => {
       room.currentPlayerIndex += 1;
       this.startPlayerAuction(room);
     }, pauseDuration);
@@ -1555,9 +1619,11 @@ class RoomManager {
 
   finishAuction(room) {
     room.state = 'RESULTS';
+    room.finishVoteState = 'FINISH_APPROVED';
     clearInterval(room.timerInterval);
     clearTimeout(room.lotTimeout);
     clearTimeout(room.aiBidTimeout);
+    if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
     room.isResolvingLot = false;
 
     // ==========================================
@@ -1600,8 +1666,15 @@ class RoomManager {
 
         const purchases = (p.squad || []).map(item => ({
           id: item.id,
-          name: item.name,
-          role: item.role,
+          name: item.auctionedPersonName || item.name,
+          role: item.auctionedPersonRole || item.role,
+          auctionedPersonName: item.auctionedPersonName || item.name,
+          auctionedPersonRole: item.auctionedPersonRole || item.role,
+          movieTitle: item.movieTitle || null,
+          directorName: item.directorName || null,
+          producerName: item.producerName || null,
+          leadActorName: item.leadActorName || null,
+          studioName: item.studioName || null,
           price: item.soldPrice !== undefined ? item.soldPrice : item.basePrice,
           image: item.image || null
         }));
@@ -1624,6 +1697,29 @@ class RoomManager {
           rank: evaluation.rankings.findIndex(r => r.id === part.id) + 1
         }));
 
+        let movieProduction = null;
+        if (room.category === 'movie_stars') {
+          const lead = purchases.find(item => item.role === 'Lead Actor' || item.category === 'Lead Actor') || purchases[0];
+          const dir = purchases.find(item => item.role === 'Director' || item.category === 'Director');
+          movieProduction = {
+            productionId: `prod_${Date.now()}_${p.id}`,
+            ownerUserId: p.id,
+            roomId: room.id,
+            movieTitle: p.movieTitle || 'Untitled Feature',
+            studioEntityId: p.teamId || 'custom_studio',
+            studioNameSnapshot: p.teamName || 'Independent Pictures',
+            directorSnapshot: dir ? dir.name : 'Unknown Director',
+            leadActorSnapshot: lead ? lead.name : 'Ensemble Cast',
+            castSnapshot: purchases.map(it => ({
+              id: it.id,
+              name: it.name,
+              role: it.role || it.category || 'Cast',
+              price: it.price || it.winningBid || 0,
+            })),
+            completedAt: new Date().toISOString()
+          };
+        }
+
         const matchRecord = {
           matchId: room.id,
           roomCode: room.roomCode || null,
@@ -1632,6 +1728,11 @@ class RoomManager {
           categoryTitle: room.categoryConfig?.title || room.category,
           currencySymbol: room.categoryConfig?.currencySymbol || '$',
           unitLabel: room.categoryConfig?.unitLabel || 'M',
+          teamId: p.teamId || null,
+          teamName: p.teamName || 'My Team',
+          isCustom: Boolean(p.isCustom),
+          movieTitle: p.movieTitle || null,
+          movieProduction,
           budget: room.proposedBudget,
           squad: p.squad,
           purchases,
@@ -1703,6 +1804,8 @@ class RoomManager {
       timerEndTimestamp: room.timerEndTimestamp || null,
       timerDurationMs: room.timerDurationMs || 10000,
       teamOwnership: room.teamOwnership ? Object.fromEntries(room.teamOwnership) : {},
+      finishVoteState: room.finishVoteState || 'NORMAL',
+      finishVote: room.finishVote || null,
       reactions: room.reactions,
       analysis: room.analysis || null
     };
@@ -1727,6 +1830,267 @@ class RoomManager {
     if (room.reactions.length > 20) room.reactions.shift();
 
     this.io.to(room.id).emit('reaction_posted', rxPayload);
+  }
+
+  // =========================================================================
+  // UNIVERSAL FINISH AUCTION CONSENSUS SYSTEM (Server-Authoritative)
+  // Strict Invariant: Runs in parallel with live auction. Never alters timer,
+  // countdowns, bids, or natural lot progression. 100% Unanimous Agreement.
+  // =========================================================================
+
+  getActiveEligibleParticipants(room) {
+    // Only participants who are currently active in the room (connected socket or active bot)
+    const eligible = [];
+    const hasSocketsMap = Boolean(this.io && this.io.sockets && this.io.sockets.sockets);
+
+    for (const [pId, p] of room.participants.entries()) {
+      if (p.isAI) {
+        eligible.push({ id: pId, name: p.name, isAI: true });
+      } else {
+        // Discard permanently departed or ghost participants
+        if (p.hasLeft || p.isGhost) {
+          continue;
+        }
+
+        if (hasSocketsMap) {
+          const socketObj = this.io.sockets.sockets.get ? this.io.sockets.sockets.get(p.socketId) : this.io.sockets.sockets[p.socketId];
+          const isConnected = socketObj && (socketObj.connected !== false);
+          if (isConnected || !p.socketId) {
+            eligible.push({ id: pId, name: p.name, isAI: false, socketId: p.socketId });
+          } else if (p.isDisconnected) {
+            // Disconnected ghost: do not block consensus
+            continue;
+          } else {
+            eligible.push({ id: pId, name: p.name, isAI: false, socketId: p.socketId });
+          }
+        } else {
+          eligible.push({ id: pId, name: p.name, isAI: false, socketId: p.socketId });
+        }
+      }
+    }
+    return eligible;
+  }
+
+  handleSocketDisconnect(socketId) {
+    if (!socketId) return;
+    for (const room of this.rooms.values()) {
+      for (const [pId, p] of room.participants.entries()) {
+        if (p.socketId === socketId) {
+          p.isDisconnected = true;
+          p.disconnectedAt = Date.now();
+
+          // If a finish auction request is currently pending, update voting tally
+          if (room.finishVoteState === 'FINISH_REQUESTED' && room.finishVote) {
+            const eligible = this.getActiveEligibleParticipants(room);
+            const eligibleIds = eligible.map(e => e.id);
+            room.finishVote.eligibleParticipantIds = eligibleIds;
+            room.finishVote.totalRequired = eligibleIds.length;
+            const agreedCount = eligibleIds.filter(id => room.finishVote.votes[id] === true).length;
+            room.finishVote.agreedCount = agreedCount;
+
+            // If remaining active participants now reach 100% unanimous agreement
+            if (agreedCount >= room.finishVote.totalRequired && room.finishVote.totalRequired > 0) {
+              this.resolveAndFinishAuction(room);
+              return;
+            } else {
+              this.broadcastRoomState(room);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  requestFinishAuction(roomId, userId) {
+    const room = this.rooms.get(roomId);
+    if (!room) return { success: false, message: 'Room not found.' };
+
+    const isLiveAuction = room.state === 'AUCTION_ACTIVE' || room.state === 'SOLD' || room.state === 'UNSOLD';
+    if (!isLiveAuction) {
+      return { success: false, message: 'Finish auction can only be requested during a live match.' };
+    }
+
+    // Atomic concurrency handling: If another participant taps at the same time, record as AGREE vote
+    if (room.finishVoteState === 'FINISH_REQUESTED') {
+      if (room.finishVote && !room.finishVote.votes[userId]) {
+        return this.voteFinishAuction(roomId, userId, true);
+      }
+      return { success: true, alreadyRequested: true, room };
+    }
+
+    const participant = room.participants.get(userId);
+    if (!participant) {
+      return { success: false, message: 'Participant not found in room.' };
+    }
+
+    const eligible = this.getActiveEligibleParticipants(room);
+    const eligibleIds = eligible.map(e => e.id);
+
+    // Requester is automatically counted as agreed (1 vote)
+    const votes = {};
+    votes[userId] = true;
+
+    // In computer/bot mode, active AI bots automatically agree
+    room.bots.forEach(b => {
+      votes[b.id] = true;
+    });
+
+    const totalRequired = eligibleIds.length;
+    const agreedCount = eligibleIds.filter(id => votes[id] === true).length;
+
+    room.finishVoteState = 'FINISH_REQUESTED';
+    room.finishVote = {
+      requestedBy: userId,
+      requesterName: participant.name || 'Participant',
+      votes,
+      eligibleParticipantIds: eligibleIds,
+      totalRequired,
+      agreedCount,
+      requestedAt: Date.now()
+    };
+
+    console.log(`[FINISH_AUCTION_REQUESTED] Room: ${room.id} by ${participant.name} (${userId}). Total required: ${totalRequired}, Agreed: ${agreedCount}`);
+
+    // Broadcast updated finish vote state to room
+    this.broadcastRoomState(room);
+    this.io.to(room.id).emit('finish_auction_requested', {
+      requestedBy: userId,
+      requesterName: participant.name,
+      totalRequired,
+      agreedCount
+    });
+
+    // Check if immediately unanimous (e.g. 1 human + bots, or all eligible already agreed)
+    if (agreedCount >= totalRequired && totalRequired > 0) {
+      this.resolveAndFinishAuction(room);
+      return { success: true, finished: true, room };
+    }
+
+    return { success: true, finished: false, room };
+  }
+
+  voteFinishAuction(roomId, userId, agreed) {
+    const room = this.rooms.get(roomId);
+    if (!room || room.finishVoteState !== 'FINISH_REQUESTED' || !room.finishVote) {
+      return { success: false, message: 'No active finish auction request to vote on.' };
+    }
+
+    const participant = room.participants.get(userId);
+    if (!participant) {
+      return { success: false, message: 'Participant not found.' };
+    }
+
+    // 1. IGNORE BEHAVIOR: Any participant selecting IGNORE cancels request immediately
+    if (!agreed) {
+      console.log(`[FINISH_AUCTION_IGNORED] Room: ${room.id} by ${participant.name} (${userId}). Request cancelled.`);
+      room.finishVoteState = 'FINISH_REJECTED';
+      const cancelledBy = participant.name || 'Participant';
+
+      this.io.to(room.id).emit('finish_auction_cancelled', {
+        cancelledBy,
+        userId,
+        message: `${cancelledBy} chose to continue the auction.`
+      });
+
+      // Clear finish vote and return to NORMAL. Timer and lot remain completely untouched!
+      room.finishVote = null;
+      room.finishVoteState = 'NORMAL';
+      this.broadcastRoomState(room);
+      return { success: true, cancelled: true };
+    }
+
+    // 2. AGREE BEHAVIOR: Register vote exactly once
+    if (room.finishVote.votes[userId] === true) {
+      return { success: true, alreadyVoted: true };
+    }
+
+    room.finishVote.votes[userId] = true;
+
+    // Refresh eligible participants in case anyone disconnected
+    const eligible = this.getActiveEligibleParticipants(room);
+    const eligibleIds = eligible.map(e => e.id);
+    room.finishVote.eligibleParticipantIds = eligibleIds;
+    room.finishVote.totalRequired = eligibleIds.length;
+
+    const agreedCount = eligibleIds.filter(id => room.finishVote.votes[id] === true).length;
+    room.finishVote.agreedCount = agreedCount;
+
+    console.log(`[FINISH_AUCTION_AGREE] Room: ${room.id} by ${participant.name} (${userId}). Progress: ${agreedCount}/${room.finishVote.totalRequired}`);
+
+    this.broadcastRoomState(room);
+    this.io.to(room.id).emit('finish_auction_progress', {
+      voterId: userId,
+      voterName: participant.name,
+      agreedCount,
+      totalRequired: room.finishVote.totalRequired
+    });
+
+    // 3. UNANIMOUS AGREEMENT CHECK: 100% of eligible participants must agree
+    if (agreedCount >= room.finishVote.totalRequired && room.finishVote.totalRequired > 0) {
+      this.resolveAndFinishAuction(room);
+      return { success: true, finished: true, room };
+    }
+
+    return { success: true, finished: false, room };
+  }
+
+  resolveAndFinishAuction(room) {
+    console.log(`[FINISH_AUCTION_APPROVED] Room: ${room.id}. Unanimous agreement reached! Resolving lot & finishing auction.`);
+    room.finishVoteState = 'FINISH_APPROVED';
+
+    // Clear any timers
+    clearInterval(room.timerInterval);
+    clearTimeout(room.lotTimeout);
+    clearTimeout(room.aiBidTimeout);
+    if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
+
+    // Rule: Resolve current lot safely before finishing
+    // If unanimous agreement occurs while a lot is actively in AUCTION_ACTIVE:
+    if (room.state === 'AUCTION_ACTIVE' && !room.isResolvingLot) {
+      room.isResolvingLot = true;
+      const player = room.currentPlayer || room.playerPool[room.currentPlayerIndex];
+      if (player) {
+        if (room.currentLeader && room.currentBid > 0) {
+          // Current lot is SOLD to the current highest bidder
+          const winner = room.participants.get(room.currentLeader.id);
+          if (winner) {
+            winner.squad.push({
+              ...player,
+              soldPrice: room.currentBid
+            });
+            const totalSpent = winner.squad.reduce((sum, item) => sum + (item.soldPrice || item.basePrice || 0), 0);
+            winner.purse = Math.round((winner.startingBudget - totalSpent) * 10) / 10;
+          }
+
+          if (room.currentLotRecord) {
+            room.currentLotRecord.status = 'SOLD';
+            room.currentLotRecord.winnerId = winner ? winner.id : null;
+            room.currentLotRecord.soldPrice = room.currentBid;
+            room.lotSequence.push(room.currentLotRecord);
+          }
+
+          room.availablePlayerPool = room.availablePlayerPool.filter(p => p.id !== player.id);
+          room.availablePlayerIds.delete(player.id);
+          console.log(`[FINISH_AUCTION] Final lot ${room.currentLotNumber} SOLD to ${winner ? winner.name : 'Unknown'} for ₹${room.currentBid}`);
+        } else {
+          // Current lot is marked UNSOLD if there are no bids
+          if (room.currentLotRecord) {
+            room.currentLotRecord.status = 'UNSOLD';
+            room.currentLotRecord.winnerId = null;
+            room.currentLotRecord.soldPrice = 0;
+            room.lotSequence.push(room.currentLotRecord);
+          }
+
+          room.availablePlayerPool = room.availablePlayerPool.filter(p => p.id !== player.id);
+          room.availablePlayerIds.delete(player.id);
+          console.log(`[FINISH_AUCTION] Final lot ${room.currentLotNumber} UNSOLD with 0 bids.`);
+        }
+      }
+    }
+    // If room.state is already 'SOLD' or 'UNSOLD', the lot was already naturally resolved. Never duplicate it!
+
+    // Transition room to RESULTS
+    this.finishAuction(room);
   }
 }
 

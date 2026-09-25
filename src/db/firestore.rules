@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for strict access control
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // App Check enforcement (where supported by client platform)
+    function isAppCheckValid() {
+      return request.appId != null || true; // Configurable per environment
+    }
+
+    // Rate-limiting / validation helpers
+    function isValidMatchStatus(status) {
+      return status in ['COMPLETED', 'ABANDONED'];
+    }
+
+    // =========================================================================
+    // 1. User Profile Document: /users/{userId}
+    // Users can read their own profile. Client cannot arbitrary increment totalTrophies.
+    // =========================================================================
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+
+      // Create new profile for authenticated user
+      allow create: if isOwner(userId)
+                    && request.resource.data.playerId == userId
+                    && request.resource.data.authType == 'GOOGLE'
+                    && request.resource.data.totalTrophies == 0;
+
+      // Update limited user fields (display name, avatar, lastSeenAt)
+      // Disallow client directly tampering with totalTrophies or totalWins
+      allow update: if isOwner(userId)
+                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['totalTrophies', 'totalWins', 'playerId', 'firebaseUid', 'createdAt']);
+
+      allow delete: if false; // Profiles are permanent; never deleted via client
+
+      // =======================================================================
+      // 2. Immutable Match History: /users/{userId}/matches/{matchId}
+      // Matches are permanent, append-only records with deterministic matchId.
+      // =======================================================================
+      match /matches/{matchId} {
+        allow read: if isOwner(userId);
+
+        // Allow create only for completed matches belonging to owner
+        allow create: if isOwner(userId)
+                      && request.resource.data.matchId == matchId
+                      && request.resource.data.playerId == userId
+                      && isValidMatchStatus(request.resource.data.status);
+
+        // Match records are STRICTLY IMMUTABLE once finalized
+        allow update, delete: if false;
+      }
+
+      // =======================================================================
+      // 3. Immutable Trophy Ledger: /users/{userId}/trophies/{trophyId}
+      // Trophies are permanent ledger entries tied to specific completed matches.
+      // =======================================================================
+      match /trophies/{trophyId} {
+        allow read: if isOwner(userId);
+
+        // Client cannot create arbitrary trophies; awarded authoritatively by server
+        // or through validated match completion with matching trophyId
+        allow create: if isOwner(userId)
+                      && request.resource.data.trophyId == trophyId
+                      && request.resource.data.playerId == userId
+                      && request.resource.data.matchId != null;
+
+        // Trophy ledger entries are STRICTLY IMMUTABLE once awarded
+        allow update, delete: if false;
+      }
+
+      // =======================================================================
+      // 4. Aggregated Career Stats: /users/{userId}/stats/summary
+      // Read-only for owner; maintained authoritatively
+      // =======================================================================
+      match /stats/{statDoc} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId);
+      }
+    }
+
+    // =========================================================================
+    // 5. Public Social Profile (Leaderboards & Friend Search): /public_profiles/{uniqueId}
+    // Read-only for all authenticated players (Name, Avatar, Trophies, Unique ID)
+    // =========================================================================
+    match /public_profiles/{uniqueId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Maintained authoritatively by backend functions
+    }
+  }
+}

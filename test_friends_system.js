@@ -137,17 +137,12 @@ assert.strictEqual(hostRoom.participants.size, 3);
 console.log(`✓ Friend 2 joined via accepted invite. Participants count: ${hostRoom.participants.size}\n`);
 
 // 9. Test Room Teardown & Invitation Cancellation
-console.log('Test 9: Room leave, host migration and complete cleanup');
-roomManager.leaveRoom(hostRoom.id, hostUser.id);
-assert.strictEqual(hostRoom.hostId, friendUser.id, 'Host should migrate to next human participant');
-
-// Now all other participants leave
-roomManager.leaveRoom(hostRoom.id, friendUser.id);
-roomManager.leaveRoom(hostRoom.id, friendUser2.id);
-
-assert.strictEqual(roomManager.getRoom(hostRoom.id), null, 'Room should be destroyed when all humans leave');
+console.log('Test 9: Room leave and complete cleanup when host leaves');
+const leaveRes = roomManager.leaveRoom(hostRoom.id, hostUser.id);
+assert.strictEqual(leaveRes.roomClosed, true, 'Room should close when host leaves');
+assert.strictEqual(roomManager.getRoom(hostRoom.id), null, 'Room should be destroyed when host leaves');
 assert.strictEqual(roomManager.getRoomByCode(hostRoom.roomCode), null, 'Room code mapping should be cleared');
-console.log('✓ Host migration, room cleanup, and code de-registration verified\n');
+console.log('✓ Host departure, room cleanup, and code de-registration verified\n');
 
 console.log('====================================================');
 console.log('ALL FRIEND ROOM & INVITATION SYSTEM TESTS PASSED! 🎉');

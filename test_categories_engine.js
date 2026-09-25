@@ -35,16 +35,16 @@ const nbaTeams = nbaModule.getFranchises();
 const filmStudios = movieModule.getFranchises();
 
 assert.strictEqual(iplFranchises.length, 10, 'IPL franchises must equal 10');
-assert.strictEqual(fifaTeams.length, 10, 'FIFA teams must equal 10');
-assert.strictEqual(f1Constructors.length, 10, 'F1 constructors must equal 10');
-assert.strictEqual(nbaTeams.length, 10, 'NBA teams must equal 10');
-assert.strictEqual(filmStudios.length, 10, 'Film studios must equal 10');
+assert.strictEqual(fifaTeams.length, 48, 'FIFA teams must equal 48 selectable nations');
+assert.strictEqual(f1Constructors.length, 11, 'F1 constructors must equal 11 for 2026 grid');
+assert.strictEqual(nbaTeams.length, 30, 'NBA teams must equal 30 official franchises');
+assert.strictEqual(filmStudios.length, 20, 'Film studios must equal 20 curated studios');
 
 console.log(`✓ IPL Teams (10): ${iplFranchises.map(f => f.code).join(', ')}`);
-console.log(`✓ FIFA Teams (10): ${fifaTeams.map(t => t.code).join(', ')}`);
-console.log(`✓ F1 Constructors (10): ${f1Constructors.map(c => c.code).join(', ')}`);
-console.log(`✓ NBA Franchises (10): ${nbaTeams.map(t => t.code).join(', ')}`);
-console.log(`✓ Film Studios (10): ${filmStudios.map(s => s.code).join(', ')}`);
+console.log(`✓ FIFA Teams (48): ${fifaTeams.slice(0, 5).map(t => t.code).join(', ')}...`);
+console.log(`✓ F1 Constructors (11): ${f1Constructors.map(c => c.code).join(', ')}`);
+console.log(`✓ NBA Franchises (30): ${nbaTeams.slice(0, 5).map(t => t.code).join(', ')}...`);
+console.log(`✓ Film Studios (20): ${filmStudios.slice(0, 5).map(s => s.code).join(', ')}...`);
 
 // Terminology verification
 assert.strictEqual(movieModule.franchiseLabel, 'Film Studio', 'Movie Stars must use Film Studio terminology');

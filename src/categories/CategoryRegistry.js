@@ -595,6 +595,43 @@ const NBA_CATEGORY_MODULE = {
   }
 };
 
+// Helper to ensure 100% explicit separation of Auctioned Person vs Movie Context
+function enrichMovieTalent(item) {
+  if (!item) return item;
+  const personName = item.auctionedPersonName || item.name;
+  const roleRaw = item.auctionedPersonRole || item.role || 'Talent';
+  
+  let roleNorm = roleRaw.toUpperCase();
+  if (roleRaw === 'Male Actor' || roleRaw === 'Female Actor') {
+    roleNorm = 'LEAD ACTOR';
+  } else if (roleRaw === 'Male Singer' || roleRaw === 'Female Singer') {
+    roleNorm = 'PLAYBACK SINGER';
+  } else if (roleRaw.toLowerCase() === 'director') {
+    roleNorm = 'DIRECTOR';
+  } else if (roleRaw.toLowerCase() === 'producer') {
+    roleNorm = 'PRODUCER';
+  }
+
+  const movie = item.movieTitle || (item.notableWorks && item.notableWorks[0]) || 'Feature Film';
+  const director = item.directorName || (roleNorm === 'DIRECTOR' ? personName : 'Visionary Director');
+  const producer = item.producerName || (roleNorm === 'PRODUCER' ? personName : 'Executive Producer');
+  const leadActor = item.leadActorName || (roleNorm === 'LEAD ACTOR' ? personName : (item.notableWorks && item.notableWorks[1]) || 'Ensemble Lead');
+  const studio = item.studioName || (item.industry ? `${item.industry} Studios` : 'Premier Film Studio');
+  const castList = Array.isArray(item.cast) ? item.cast : (item.notableWorks || []);
+
+  return {
+    ...item,
+    auctionedPersonName: personName,
+    auctionedPersonRole: roleNorm,
+    movieTitle: movie,
+    directorName: director,
+    producerName: producer,
+    leadActorName: leadActor,
+    studioName: studio,
+    cast: castList
+  };
+}
+
 // Dedicated Movie Stars Pool Generator with balanced role distribution and strict deduplication
 function createMovieStarsPoolGenerator(masterList, poolSizeFn = calculateDynamicPoolSize) {
   return (participantCount, customPoolSize) => {
@@ -636,7 +673,8 @@ function createMovieStarsPoolGenerator(masterList, poolSizeFn = calculateDynamic
       if (!seenIds.has(item.id) && !seenNames.has(cleanName)) {
         seenIds.add(item.id);
         seenNames.add(cleanName);
-        picked.push({ ...item, AUCTIONED: false });
+        const enriched = enrichMovieTalent(item);
+        picked.push({ ...enriched, AUCTIONED: false });
         return true;
       }
       return false;
@@ -743,7 +781,7 @@ const MOVIE_STARS_CATEGORY_MODULE = {
   getFranchiseById: getFilmStudioById,
   getFranchiseByName: getFilmStudioByName,
 
-  getItems: () => movieStars,
+  getItems: () => movieStars.map(enrichMovieTalent),
   calculatePoolSize: calculateDynamicPoolSize,
   generatePool: createMovieStarsPoolGenerator(movieStars, calculateDynamicPoolSize),
 
@@ -861,8 +899,8 @@ const MOVIE_STARS_CATEGORY_MODULE = {
       let movieScore = Math.round((directorScore + castQualityScore + musicScore + starPowerScore + chemistryScore + efficiencyScore) * 10) / 10;
       movieScore = Math.min(99.4, Math.max(42.0, movieScore));
 
-      // Bespoke Non-Generic AI Critique referencing actual talent
-      const movieTitle = generateDynamicMovieTitle(p.teamName, leadDirector, leadCast);
+      // Bespoke Non-Generic AI Critique referencing actual talent & player's chosen movie title
+      const movieTitle = (p.movieTitle && p.movieTitle.trim()) || generateDynamicMovieTitle(p.teamName, leadDirector, leadCast);
       const leadNames = leadCast.length > 0 ? leadCast.map(a => a.name).join(' & ') : 'None';
       const singerNames = allSingers.length > 0 ? allSingers.map(s => s.name).join(' & ') : 'None';
 
@@ -949,8 +987,8 @@ const MOVIE_STARS_CATEGORY_MODULE = {
         },
         strengths: strengths.length > 0 ? strengths : ['Cohesive cinematic package with steady production values'],
         weaknesses: weaknesses.length > 0 ? weaknesses : ['Masterpiece package with zero glaring structural production flaws'],
-        bestBargain: bargain ? `${bargain.name} (${symbol}${bargain.soldPrice.toFixed(1)} ${unit})` : 'N/A',
-        marqueeSigning: biggestSplash ? `${biggestSplash.name} (${symbol}${biggestSplash.soldPrice.toFixed(1)} ${unit})` : 'N/A',
+        bestBargain: bargain ? `${bargain.auctionedPersonName || bargain.name} (${symbol}${bargain.soldPrice.toFixed(1)} ${unit})` : 'N/A',
+        marqueeSigning: biggestSplash ? `${biggestSplash.auctionedPersonName || biggestSplash.name} (${symbol}${biggestSplash.soldPrice.toFixed(1)} ${unit})` : 'N/A',
         compositionSummary: `${movieTitle} • Directed by ${leadDirector ? leadDirector.name : 'Uncredited'} • ${cast.length} Talent signed`,
         spent,
         remainingPurse: Math.round(p.purse * 10) / 10
