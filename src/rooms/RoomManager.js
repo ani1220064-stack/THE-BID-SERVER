@@ -771,7 +771,11 @@ class RoomManager {
       participantCount: 4
     });
 
-    room.state = 'LOBBY';
+    room.state = 'BUDGET_SELECTION';
+    room.proposedBudget = room.categoryConfig?.defaultBudget || 100.0;
+    room.budgetVotes = new Map();
+    // Bots auto-agree to default purse
+    room.bots.forEach(b => room.budgetVotes.set(b.id, true));
 
     // Add Player B to the room
     this.joinRoom(roomId, entryB.user);
@@ -845,7 +849,9 @@ class RoomManager {
     // Check if unanimous agreement reached (e.g. 1-player room or only bots)
     const allAgreed = Array.from(room.participants.keys()).every(id => room.budgetVotes.get(id) === true);
     if (allAgreed) {
-      room.state = 'LOBBY';
+      // Direct transition: Budget agreed -> Live Auction starts directly
+      this.startAuction(room.id, room.hostId);
+      return;
     }
 
     this.broadcastRoomState(room);
@@ -869,7 +875,9 @@ class RoomManager {
         p.purse = room.proposedBudget;
         p.startingBudget = room.proposedBudget;
       });
-      room.state = 'LOBBY';
+      // Direct transition: Budget agreed -> Live Auction starts directly
+      this.startAuction(room.id, room.hostId);
+      return;
     }
 
     this.broadcastRoomState(room);

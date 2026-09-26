@@ -263,7 +263,7 @@ class StoreService {
       return existing;
     }
 
-    const uniqueId = userData.uniqueId || (userData.isGuest ? '' : this.generateUniqueId('BID-'));
+    const uniqueId = userData.uniqueId || this.generateUniqueId(userData.isGuest ? 'BID-G' : 'BID-');
     const newUser = {
       id: userData.id || `user_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       name: userData.name || 'Bidder',
@@ -308,12 +308,29 @@ class StoreService {
       if (match) return match;
     }
 
-    return Object.values(this.data.users).find(u => 
-      (u.uniqueId && u.uniqueId.trim().toUpperCase() === cleanUpper) ||
-      (u.id && u.id.trim().toUpperCase() === cleanUpper) ||
-      (u.googleId && u.googleId.trim() === clean) ||
-      (u.firebaseUid && u.firebaseUid.trim() === clean)
-    ) || null;
+    // Direct uniqueIdIndex check (O(1))
+    if (this.data.uniqueIdIndex) {
+      const directId = this.data.uniqueIdIndex[cleanUpper];
+      if (directId && this.data.users[directId]) return this.data.users[directId];
+
+      const prefixedId = this.data.uniqueIdIndex[`BID-${cleanUpper.replace(/^BID-?/i, '')}`];
+      if (prefixedId && this.data.users[prefixedId]) return this.data.users[prefixedId];
+    }
+
+    const strippedTarget = cleanUpper.replace(/[^A-Z0-9]/g, '');
+
+    return Object.values(this.data.users).find(u => {
+      const uNorm = (u.uniqueId || '').trim().toUpperCase();
+      const uStripped = uNorm.replace(/[^A-Z0-9]/g, '');
+
+      return (
+        uNorm === cleanUpper ||
+        (strippedTarget.length >= 4 && uStripped === strippedTarget) ||
+        (u.id && u.id.trim().toUpperCase() === cleanUpper) ||
+        (u.googleId && u.googleId.trim() === clean) ||
+        (u.firebaseUid && u.firebaseUid.trim() === clean)
+      );
+    }) || null;
   }
 
   areFriends(uniqueIdA, uniqueIdB) {
@@ -362,13 +379,6 @@ class StoreService {
       return { success: false, message: 'You cannot add yourself as a friend.' };
     }
 
-    if (fromUser.isGuest) {
-      return { success: false, error: 'GUEST_RESTRICTED', message: 'Guest accounts cannot send friend requests. Please sign in with Google.' };
-    }
-    if (target.isGuest) {
-      return { success: false, error: 'GUEST_RESTRICTED', message: 'Cannot send friend request to a guest account.' };
-    }
-
     // 1. Check if already mutual permanent friends
     if (this.areFriends(normFrom, normTarget)) {
       return { success: false, error: 'ALREADY_FRIENDS', message: 'You are already permanent friends with this player.' };
@@ -378,10 +388,13 @@ class StoreService {
     const pendingOnSender = this.data.friendRequests[normFrom] || [];
     const reverseReq = pendingOnSender.find(r => r.status === 'PENDING' && (r.fromUniqueId || '').trim().toUpperCase() === normTarget);
     if (reverseReq) {
-      this.acceptFriendRequest(normFrom, normTarget);
+      const acceptRes = this.acceptFriendRequest(normFrom, normTarget);
       return {
         success: true,
         autoAccepted: true,
+        fromUser,
+        targetUser: target,
+        user: fromUser,
         message: `Mutual request! You and ${target.name} are now permanent friends.`
       };
     }
@@ -475,6 +488,14 @@ class StoreService {
     // Atomically mark request ACCEPTED
     pendingReq.status = 'ACCEPTED';
     pendingReq.updatedAt = new Date().toISOString();
+
+    // Also mark any reverse request on fromUser as ACCEPTED if present
+    const fromRequests = this.data.friendRequests[normFrom] || [];
+    const reversePending = fromRequests.find(r => r.status === 'PENDING' && (r.fromUniqueId || '').trim().toUpperCase() === normUser);
+    if (reversePending) {
+      reversePending.status = 'ACCEPTED';
+      reversePending.updatedAt = new Date().toISOString();
+    }
 
     // Atomically establish permanent reciprocal friendship in database
     this.data.friends[normUser] = this.data.friends[normUser] || [];
