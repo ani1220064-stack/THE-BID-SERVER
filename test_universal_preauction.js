@@ -159,9 +159,9 @@ async function runPreAuctionTestSuite() {
     passed++;
   }
 
-  // 7. Budget Agreement Consensus Reset Rule
+  // 7. Budget Agreement Consensus Direct Start Rule
   {
-    console.log('\nTest 7: Budget Agreement Unanimous Agreement & Reset upon New Proposal');
+    console.log('\nTest 7: Budget Agreement Unanimous Agreement Advances Directly to AUCTION_ACTIVE');
     const io = new MockIO();
     const rm = new RoomManager(io);
     const host = { id: 'u1', uniqueId: 'BID-1', name: 'User 1', socketId: 's1' };
@@ -170,19 +170,18 @@ async function runPreAuctionTestSuite() {
     const room = rm.createRoom({ roomId: 'room_budget_test', hostUser: host, mode: 'friends' });
     rm.joinRoom(room.id, guest);
 
-    // Both vote yes on default budget
-    rm.voteBudget(room.id, 'u1', true);
-    rm.voteBudget(room.id, 'u2', true);
-    assert.strictEqual(room.state, 'LOBBY', 'Unanimous consensus advances room to LOBBY');
-
-    // Host proposes a new budget from lobby / budget screen
+    // Host proposes a new budget from budget screen
     rm.proposeBudget(room.id, 'u1', 150);
     assert.strictEqual(room.proposedBudget, 150);
-    assert.strictEqual(room.state, 'BUDGET_SELECTION', 'Room returns to BUDGET_SELECTION');
+    assert.strictEqual(room.state, 'BUDGET_SELECTION', 'Room is in BUDGET_SELECTION while awaiting consensus');
     assert.strictEqual(room.budgetVotes.get('u1'), true, 'Proposer automatically votes yes');
-    assert.strictEqual(room.budgetVotes.get('u2'), undefined, 'All other votes are completely reset');
+    assert.strictEqual(room.budgetVotes.get('u2'), undefined, 'Guest vote is reset/pending');
 
-    console.log('  ✓ Budget consensus verified: unanimous advance + reset on new proposal');
+    // Guest votes yes -> Unanimous consensus reached!
+    rm.voteBudget(room.id, 'u2', true);
+    assert.strictEqual(room.state, 'AUCTION_ACTIVE', 'Unanimous consensus advances room directly to AUCTION_ACTIVE');
+
+    console.log('  ✓ Budget consensus verified: unanimous advance directly to AUCTION_ACTIVE');
     passed++;
   }
 

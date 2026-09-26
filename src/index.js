@@ -123,9 +123,21 @@ async function verifyGoogleToken(token) {
           if (!parsed.sub && !parsed.user_id) {
             return reject(new Error('Invalid token: missing sub or user_id identifier'));
           }
+
+          // Verify token expiration
+          if (parsed.exp && Number(parsed.exp) * 1000 < Date.now()) {
+            return reject(new Error('Google ID token has expired'));
+          }
+
+          // Verify token issuer
+          if (parsed.iss && !parsed.iss.includes('accounts.google.com')) {
+            return reject(new Error(`Invalid token issuer: ${parsed.iss}`));
+          }
+
           const tokenAud = parsed.aud || parsed.audience || parsed.issued_to;
           const validAuds = [
             process.env.GOOGLE_CLIENT_ID,
+            process.env.GOOGLE_WEB_CLIENT_ID,
             process.env.GOOGLE_ANDROID_CLIENT_ID,
             '108576663486-brj7gheh99gn1psp91p99vpku708t258.apps.googleusercontent.com',
             '108576663486-gtuqspjoi7gu6fcodr2ufihqbcd0gds6.apps.googleusercontent.com'
@@ -298,44 +310,32 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', product: 'THE BID', world: 'IPL Cricket', timestamp: Date.now() });
 });
 
-// In-memory OAuth temporary session store for state-based auth completion
-const oauthSessions = new Map(); // state -> { idToken, user, timestamp }
-
-// Periodic cleanup of stale sessions older than 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [state, session] of oauthSessions.entries()) {
-    if (now - session.timestamp > 300000) {
-      oauthSessions.delete(state);
-    }
-  }
-}, 60000);
-
-// Authentication / Profile Endpoints (Screens 02, 03, 04)
-// Real Google Authentication Endpoint (Server-Side Verified Stable Identity)
-app.post('/api/auth/google', async (req, res) => {
+// Dedicated Native Google Authentication Endpoint (Server-Side Cryptographically Verified)
+// POST /api/auth/google/native (and mirrored POST /api/auth/google)
+const handleNativeGoogleAuth = async (req, res) => {
   try {
-    const { idToken, googleProfile } = req.body;
-    let verifiedGoogleId;
-    let name = 'Google Player';
-    let email = null;
-    let avatar = 'avatar_1';
-
-    if (idToken) {
-      const verified = await verifyGoogleToken(idToken);
-      verifiedGoogleId = verified.sub;
-      name = verified.name || name;
-      email = verified.email || email;
-      avatar = verified.picture || avatar;
-    } else if (googleProfile && (googleProfile.id || googleProfile.email)) {
-      verifiedGoogleId = googleProfile.id || `g_${googleProfile.email}`;
-      name = googleProfile.name || googleProfile.givenName || name;
-      email = googleProfile.email || email;
-      avatar = googleProfile.photo || avatar;
-    } else {
-      return res.status(400).json({ error: 'idToken or googleProfile is required for Google authentication' });
+    const { idToken } = req.body;
+    if (!idToken || typeof idToken !== 'string') {
+      return res.status(400).json({
+        error: 'idToken is required and must be a valid Google ID token string'
+      });
     }
 
+    // 1. Cryptographically verify the Google ID token via Google's tokeninfo
+    const verified = await verifyGoogleToken(idToken);
+
+    // 2. Extract stable Google subject identifier (sub)
+    const verifiedGoogleId = verified.sub;
+    if (!verifiedGoogleId) {
+      return res.status(401).json({ error: 'Token missing stable subject identifier (sub)' });
+    }
+
+    // Identity claims derived strictly from verified Google token (never trusting client parameters)
+    const name = verified.name || 'Google Bidder';
+    const email = verified.email || null;
+    const avatar = verified.picture || 'avatar_1';
+
+    // 3. Atomically resolve or create the permanent THE BID account
     const user = store.resolveOrCreateGoogleUser({
       verifiedGoogleId,
       name,
@@ -343,190 +343,29 @@ app.post('/api/auth/google', async (req, res) => {
       avatar
     });
 
+    // 4. Return authoritative full profile & authenticated session
     const fullProfile = store.getUserFullProfile(user.uniqueId);
-    res.json({
+    console.log(`[NATIVE_AUTH] User authenticated successfully: Google Sub=${verifiedGoogleId} -> Player ID=${user.uniqueId}`);
+
+    return res.status(200).json({
       success: true,
       user: fullProfile.user,
-      friends: fullProfile.friends,
-      requests: fullProfile.requests,
-      history: fullProfile.history,
+      friends: fullProfile.friends || [],
+      requests: fullProfile.requests || [],
+      history: fullProfile.history || [],
       trophies: fullProfile.trophies || []
     });
   } catch (err) {
-    console.error('[AUTH_ERROR] Google token verification failed:', err.message);
-    res.status(401).json({ error: 'Authentication failed', message: err.message });
-  }
-});
-
-// OAuth State-Based Handshake Endpoints (Zero-Failure Bridge for Mobile Browser Auth)
-app.post('/api/auth/google/session', async (req, res) => {
-  try {
-    const { state, idToken, accessToken } = req.body;
-    if (!state || (!idToken && !accessToken)) {
-      return res.status(400).json({ error: 'state and idToken are required' });
-    }
-
-    const tokenToVerify = idToken || accessToken;
-    const verified = await verifyGoogleToken(tokenToVerify);
-    const verifiedGoogleId = verified.sub;
-
-    const user = store.resolveOrCreateGoogleUser({
-      verifiedGoogleId,
-      name: verified.name,
-      email: verified.email,
-      avatar: verified.picture
+    console.error('[NATIVE_AUTH_ERROR] Google token verification failed:', err.message);
+    return res.status(401).json({
+      error: 'Google authentication failed',
+      message: err.message
     });
-
-    const fullProfile = store.getUserFullProfile(user.uniqueId);
-    oauthSessions.set(state, {
-      success: true,
-      user: fullProfile.user,
-      friends: fullProfile.friends,
-      requests: fullProfile.requests,
-      history: fullProfile.history,
-      trophies: fullProfile.trophies || [],
-      idToken: tokenToVerify,
-      timestamp: Date.now()
-    });
-
-    console.log(`[AUTH_SESSION] Successfully stored authenticated session for state [${state}] -> ${user.uniqueId}`);
-    res.json({ success: true, message: 'Session authenticated and stored' });
-  } catch (err) {
-    console.error('[AUTH_SESSION_ERROR]', err.message);
-    res.status(500).json({ error: err.message });
   }
-});
-
-app.get('/api/auth/google/session/:state', (req, res) => {
-  const state = req.params.state;
-  if (!state || !oauthSessions.has(state)) {
-    return res.json({ pending: true });
-  }
-
-  const sessionData = oauthSessions.get(state);
-  res.json({ success: true, ...sessionData });
-});
-
-// Google OAuth Redirect Bridge (Eliminates 404 redirect errors)
-// Bridges web-based OAuth redirects into the native app via server session + thebid://oauth + intent://
-const handleGoogleOAuthCallback = (req, res) => {
-  res.setHeader('Content-Type', 'text/html');
-  res.status(200).send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>THE BID — Google Sign-In</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {
-      background: #070A0E;
-      color: #E8ECEF;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-      padding: 24px;
-      box-sizing: border-box;
-    }
-    .card {
-      background: #0D131B;
-      border: 1px solid #1E293B;
-      border-radius: 16px;
-      padding: 32px 24px;
-      text-align: center;
-      max-width: 400px;
-      width: 100%;
-      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
-    }
-    .spinner {
-      width: 48px;
-      height: 48px;
-      border: 3px solid #1E293B;
-      border-top-color: #00E5FF;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      margin: 0 auto 20px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    h2 { margin: 0 0 8px; font-size: 22px; color: #FFFFFF; font-weight: 800; letter-spacing: 0.5px; }
-    p { color: #94A3B8; font-size: 14px; line-height: 1.5; margin: 0 0 24px; }
-    .btn {
-      display: block;
-      background: #00E5FF;
-      color: #070A0E;
-      font-weight: 900;
-      font-size: 14px;
-      padding: 16px 24px;
-      border-radius: 12px;
-      text-decoration: none;
-      letter-spacing: 0.5px;
-      text-transform: uppercase;
-      box-shadow: 0 0 20px rgba(0, 229, 255, 0.4);
-      cursor: pointer;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="spinner"></div>
-    <h2>Authentication Verified</h2>
-    <p>Transferring credentials to THE BID...</p>
-    <a id="launchBtn" class="btn" href="#">RETURN TO THE BID</a>
-  </div>
-  <script>
-    var hash = window.location.hash || '';
-    var search = window.location.search || '';
-    var rawStr = hash ? hash.substring(1) : (search ? search.substring(1) : '');
-    var params = new URLSearchParams(rawStr);
-    var idToken = params.get('id_token') || params.get('access_token') || '';
-    var state = params.get('state') || '';
-
-    // 1. Immediately push token to backend session store
-    if (state && idToken) {
-      try {
-        fetch('/api/auth/google/session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ state: state, idToken: idToken })
-        }).catch(function() {});
-      } catch (e) {}
-    }
-
-    var deepLink = 'thebid://oauth?' + rawStr;
-    var intentUrl = 'intent://oauth?' + rawStr + '#Intent;scheme=thebid;package=com.thebid.app;end';
-
-    var btn = document.getElementById('launchBtn');
-    btn.href = deepLink;
-    btn.onclick = function() {
-      try { window.location.href = intentUrl; } catch(e) {}
-      setTimeout(function() { window.location.href = deepLink; }, 250);
-    };
-
-    // Auto-launch deep link & Intent URL
-    try {
-      window.location.href = intentUrl;
-    } catch (e) {
-      window.location.href = deepLink;
-    }
-
-    setTimeout(function() {
-      try { window.location.href = intentUrl; } catch(e) {}
-    }, 300);
-
-    setTimeout(function() {
-      try { window.location.href = deepLink; } catch(e) {}
-    }, 600);
-  </script>
-</body>
-</html>`);
 };
 
-app.get('/api/auth/google/callback', handleGoogleOAuthCallback);
-app.get('/auth/google/callback', handleGoogleOAuthCallback);
-app.get('/--/oauth', handleGoogleOAuthCallback);
-app.get('/oauth', handleGoogleOAuthCallback);
+app.post('/api/auth/google/native', handleNativeGoogleAuth);
+app.post('/api/auth/google', handleNativeGoogleAuth);
 
 // Authoritative Cloud Restore Endpoint (Survives App Deletion / Reinstallation)
 app.get('/api/account/restore/:uniqueId', (req, res) => {

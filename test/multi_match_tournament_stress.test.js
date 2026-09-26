@@ -104,13 +104,9 @@ async function playSingleMatch({
     });
   });
 
-  // State: BUDGET_SELECTION -> Vote budget
+  // State: BUDGET_SELECTION -> Vote budget -> transitions directly to AUCTION_ACTIVE
   socket.emit('vote_budget', { roomId, userId: humanUser.id, agreed: true });
-  await collector.waitForState(s => s.state === 'LOBBY');
-
-  // State: LOBBY -> Toggle ready and start auction
-  socket.emit('toggle_ready', { roomId, userId: humanUser.id });
-  socket.emit('start_auction', { roomId, userId: humanUser.id });
+  await collector.waitForState(s => s.state === 'AUCTION_ACTIVE');
 
   // Handle active lots according to human strategy
   const lotsHandled = new Set();

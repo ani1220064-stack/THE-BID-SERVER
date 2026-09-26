@@ -533,13 +533,9 @@ async function runCoreAuctionEngineStressTest() {
     }
   });
 
-  // Vote budget -> transitions to LOBBY
+  // Vote budget -> transitions directly to AUCTION_ACTIVE
   fullMatchClient.emit('vote_budget', { roomId: fullRoomId, userId: humanUser.id, agreed: true });
-  await fullCollector.waitForState(s => s.state === 'LOBBY');
-
-  // Toggle ready & start auction -> transitions to AUCTION_ACTIVE
-  fullMatchClient.emit('toggle_ready', { roomId: fullRoomId, userId: humanUser.id });
-  fullMatchClient.emit('start_auction', { roomId: fullRoomId, userId: humanUser.id });
+  await fullCollector.waitForState(s => s.state === 'AUCTION_ACTIVE');
 
   // Wait for auction to complete
   console.log('    Running full 15-lot match with HIGH AI bots...');
