@@ -4,7 +4,7 @@
  */
 
 const APK_URL = "/thebid.apk";
-const BUILD_PAGE_URL = "https://expo.dev/accounts/aniversegames/projects/the-bid/builds/915023ab-59bd-4555-8a8f-39291899e62b";
+const BUILD_PAGE_URL = "https://expo.dev/accounts/aniversegames/projects/the-bid/builds/d5c0233d-f8de-4e28-b748-3b8f117bcf02";
 const GITHUB_REPO_URL = "https://github.com/ani1220064-stack/THE-BID-SERVER";
 
 function getLandingPageHtml() {
