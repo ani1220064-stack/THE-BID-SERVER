@@ -255,7 +255,7 @@ const FICTIONAL_BOT_TEAMS = [
 
 // Fictional Bot Managers (Purely fictional — no real cricket personality names)
 const FICTIONAL_BOT_MANAGERS = [
-  'Vikram AI',
+  'Vikram Rathore',
   'Arjun Vale',
   'Rohan Mehta',
   'Kabir Rao',
@@ -308,12 +308,13 @@ function getBotAvatarForName(name = '', index = 0) {
 }
 
 // Helper to generate dynamic fictional AI bot opponents
-function generateFictionalBots(count, existingNames = [], existingTeams = [], difficulty = 'MEDIUM') {
+function generateFictionalBots(count, existingNames = [], existingTeams = [], difficulty = 'MEDIUM', customManagers = null) {
   const bots = [];
   const usedNames = new Set(existingNames);
   const usedTeams = new Set(existingTeams);
 
-  const availableManagers = [...FICTIONAL_BOT_MANAGERS].sort(() => 0.5 - Math.random());
+  const pool = (Array.isArray(customManagers) && customManagers.length > 0) ? customManagers : FICTIONAL_BOT_MANAGERS;
+  const availableManagers = [...pool].sort(() => 0.5 - Math.random());
   const availableTeams = [...FICTIONAL_BOT_TEAMS].sort(() => 0.5 - Math.random());
 
   for (let i = 0; i < count; i++) {
@@ -341,7 +342,7 @@ function generateFictionalBots(count, existingNames = [], existingTeams = [], di
 }
 
 const DEFAULT_AI_PROFILES = [
-  { id: 'ai_bot_1', name: 'Vikram AI', teamName: 'Royal Strikers', strategy: 'balanced', avatar: 'avatar_male_6' },
+  { id: 'ai_bot_1', name: 'Vikram Rathore', teamName: 'Royal Strikers', strategy: 'balanced', avatar: 'avatar_male_6' },
   { id: 'ai_bot_2', name: 'Arjun Vale', teamName: 'Blue Titans', strategy: 'aggressive', avatar: 'avatar_male_5' },
   { id: 'ai_bot_3', name: 'Rohan Mehta', teamName: 'Capital Warriors', strategy: 'value_hunter', avatar: 'avatar_male_3' },
   { id: 'ai_bot_4', name: 'Kabir Rao', teamName: 'Thunder XI', strategy: 'aggressive', avatar: 'avatar_male_2' },

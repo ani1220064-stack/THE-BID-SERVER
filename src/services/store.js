@@ -14,6 +14,7 @@ const defaultState = {
   googleUsers: {},  // verifiedGoogleId -> uniqueId
   uniqueIdIndex: {}, // uniqueId -> id (Database-level UNIQUE constraint index)
   friends: {},      // uniqueId -> [friendUniqueIds]
+  friendships: {},  // canonicalPair (min::max) -> { id, userA, userB, createdAt }
   friendRequests: {}, // recipientUniqueId -> [{ fromUniqueId, fromName, date }]
   groups: {},       // groupId -> { id, name, ownerUniqueId, members: [] }
   matchHistory: {}, // uniqueId -> [{ matchId, date, mode, budget, squad: [], rank, aiScore, summary }]
@@ -94,11 +95,47 @@ class StoreService {
         u.trophies = Object.values(u.categoryTrophies).reduce((sum, val) => sum + (val || 0), 0);
       }
     }
+
+    // Initialize and rebuild canonical friendships index
+    this.data.friendships = this.data.friendships || {};
+    if (this.data.friends) {
+      for (const [uId, list] of Object.entries(this.data.friends)) {
+        if (Array.isArray(list)) {
+          for (const fId of list) {
+            const pair = this.getCanonicalPair(uId, fId);
+            if (pair && !this.data.friendships[pair]) {
+              const [uMin, uMax] = pair.split('::');
+              this.data.friendships[pair] = {
+                id: `frnd_${pair}`,
+                userA: uMin,
+                userB: uMax,
+                createdAt: new Date().toISOString()
+              };
+            }
+          }
+        }
+      }
+    }
+  }
+
+  getCanonicalPair(uniqueIdA, uniqueIdB) {
+    if (!uniqueIdA || !uniqueIdB) return null;
+    const a = String(uniqueIdA).trim().toUpperCase();
+    const b = String(uniqueIdB).trim().toUpperCase();
+    if (!a || !b || a === b) return null;
+    return a < b ? `${a}::${b}` : `${b}::${a}`;
   }
 
   saveData() {
     try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(this.data, null, 2), 'utf8');
+      const tempFile = `${DATA_FILE}.${process.pid}.${Date.now()}.${Math.random().toString(36).substr(2, 6)}.tmp`;
+      fs.writeFileSync(tempFile, JSON.stringify(this.data, null, 2), 'utf8');
+      try {
+        fs.renameSync(tempFile, DATA_FILE);
+      } catch (renameErr) {
+        fs.copyFileSync(tempFile, DATA_FILE);
+        try { fs.unlinkSync(tempFile); } catch (_) {}
+      }
     } catch (e) {
       console.error('Error saving store.json:', e.message);
     }
@@ -259,6 +296,9 @@ class StoreService {
     if (existing) {
       if (userData.name) existing.name = userData.name;
       if (userData.avatar) existing.avatar = userData.avatar;
+      if (existing.uniqueId) {
+        this.data.uniqueIdIndex[existing.uniqueId.toUpperCase()] = existing.id;
+      }
       this.saveData();
       return existing;
     }
@@ -299,37 +339,58 @@ class StoreService {
   findUserByUniqueId(identifier) {
     if (!identifier) return null;
     const clean = String(identifier).trim();
+    if (!clean) return null;
     const cleanUpper = clean.toUpperCase();
 
-    // Check googleUsers index
+    // 1. Check googleUsers index
     if (this.data.googleUsers && this.data.googleUsers[clean]) {
       const uId = this.data.googleUsers[clean];
       const match = Object.values(this.data.users).find(u => u.uniqueId === uId || u.id === uId);
       if (match) return match;
     }
 
-    // Direct uniqueIdIndex check (O(1))
+    // 2. Direct uniqueIdIndex check (O(1))
     if (this.data.uniqueIdIndex) {
-      const directId = this.data.uniqueIdIndex[cleanUpper];
-      if (directId && this.data.users[directId]) return this.data.users[directId];
+      if (this.data.uniqueIdIndex[cleanUpper] && this.data.users[this.data.uniqueIdIndex[cleanUpper]]) {
+        return this.data.users[this.data.uniqueIdIndex[cleanUpper]];
+      }
 
-      const prefixedId = this.data.uniqueIdIndex[`BID-${cleanUpper.replace(/^BID-?/i, '')}`];
-      if (prefixedId && this.data.users[prefixedId]) return this.data.users[prefixedId];
+      // Check with common prefix variants
+      const prefixVariants = [
+        `BID-${cleanUpper.replace(/^(BID|TB)-?G?/i, '')}`,
+        `BID-G${cleanUpper.replace(/^(BID|TB)-?G?/i, '')}`,
+        `TB-${cleanUpper.replace(/^(BID|TB)-?G?/i, '')}`,
+        `TB-G${cleanUpper.replace(/^(BID|TB)-?G?/i, '')}`,
+        `BID-${cleanUpper}`,
+        `TB-${cleanUpper}`
+      ];
+
+      for (const variant of prefixVariants) {
+        const id = this.data.uniqueIdIndex[variant];
+        if (id && this.data.users[id]) return this.data.users[id];
+      }
     }
 
+    // 3. Fallback exhaustive scan across all registered user records
+    const core = cleanUpper.replace(/^(BID|TB)-?G?/i, '');
     const strippedTarget = cleanUpper.replace(/[^A-Z0-9]/g, '');
 
     return Object.values(this.data.users).find(u => {
       const uNorm = (u.uniqueId || '').trim().toUpperCase();
-      const uStripped = uNorm.replace(/[^A-Z0-9]/g, '');
+      if (!uNorm) return false;
 
-      return (
-        uNorm === cleanUpper ||
-        (strippedTarget.length >= 4 && uStripped === strippedTarget) ||
-        (u.id && u.id.trim().toUpperCase() === cleanUpper) ||
-        (u.googleId && u.googleId.trim() === clean) ||
-        (u.firebaseUid && u.firebaseUid.trim() === clean)
-      );
+      if (uNorm === cleanUpper) return true;
+      if (u.id && u.id.trim().toUpperCase() === cleanUpper) return true;
+      if (u.googleId && u.googleId.trim() === clean) return true;
+      if (u.firebaseUid && u.firebaseUid.trim() === clean) return true;
+
+      const uCore = uNorm.replace(/^(BID|TB)-?G?/i, '');
+      if (core && core.length >= 3 && uCore === core) return true;
+
+      const uStripped = uNorm.replace(/[^A-Z0-9]/g, '');
+      if (strippedTarget.length >= 4 && uStripped === strippedTarget) return true;
+
+      return false;
     }) || null;
   }
 
@@ -338,8 +399,21 @@ class StoreService {
     const normA = uniqueIdA.trim().toUpperCase();
     const normB = uniqueIdB.trim().toUpperCase();
     if (normA === normB) return false;
+
+    // Check canonical pair table
+    const pair = this.getCanonicalPair(normA, normB);
+    if (pair && this.data.friendships && this.data.friendships[pair]) {
+      return true;
+    }
+
+    // Check directional lists as backwards-compatible fallback
     const friendsOfA = this.data.friends[normA] || [];
-    return friendsOfA.some(f => (f || '').trim().toUpperCase() === normB);
+    if (friendsOfA.some(f => (f || '').trim().toUpperCase() === normB)) return true;
+
+    const friendsOfB = this.data.friends[normB] || [];
+    if (friendsOfB.some(f => (f || '').trim().toUpperCase() === normA)) return true;
+
+    return false;
   }
 
   getPlayerRelationship(searcherUniqueId, targetUniqueId) {
@@ -388,7 +462,7 @@ class StoreService {
     const pendingOnSender = this.data.friendRequests[normFrom] || [];
     const reverseReq = pendingOnSender.find(r => r.status === 'PENDING' && (r.fromUniqueId || '').trim().toUpperCase() === normTarget);
     if (reverseReq) {
-      const acceptRes = this.acceptFriendRequest(normFrom, normTarget);
+      this.acceptFriendRequest(normFrom, normTarget);
       return {
         success: true,
         autoAccepted: true,
@@ -452,7 +526,7 @@ class StoreService {
     };
     this.data.friendRequests[normTarget].push(newReq);
 
-    this.saveData();
+    this.saveData(); // Authoritative DB Commit BEFORE returning
     return {
       success: true,
       request: newReq,
@@ -467,9 +541,6 @@ class StoreService {
     if (!user) {
       return { success: false, message: 'User not found.' };
     }
-    if (user.isGuest) {
-      return { success: false, error: 'GUEST_RESTRICTED', message: 'Guest accounts cannot accept friend requests.' };
-    }
 
     const fromUser = this.findUserByUniqueId(fromUniqueId);
     if (!fromUser) {
@@ -478,37 +549,50 @@ class StoreService {
     const normUser = user.uniqueId.trim().toUpperCase();
     const normFrom = fromUser.uniqueId.trim().toUpperCase();
 
-    // Security Hardening: Verify incoming request actually exists and is PENDING before establishing friendship
+    // Verify incoming request exists or mutual auto-acceptance
     const requests = this.data.friendRequests[normUser] || [];
-    const pendingReq = requests.find(r => r.status === 'PENDING' && (r.fromUniqueId || '').trim().toUpperCase() === normFrom);
-    if (!pendingReq) {
-      return { success: false, error: 'NO_PENDING_REQUEST', message: 'No pending friend request found from this player.' };
-    }
+    const pendingReq = requests.find(r => (r.status === 'PENDING' || r.status === 'ACCEPTED') && (r.fromUniqueId || '').trim().toUpperCase() === normFrom);
 
-    // Atomically mark request ACCEPTED
-    pendingReq.status = 'ACCEPTED';
-    pendingReq.updatedAt = new Date().toISOString();
+    if (pendingReq) {
+      pendingReq.status = 'ACCEPTED';
+      pendingReq.updatedAt = new Date().toISOString();
+    }
 
     // Also mark any reverse request on fromUser as ACCEPTED if present
     const fromRequests = this.data.friendRequests[normFrom] || [];
-    const reversePending = fromRequests.find(r => r.status === 'PENDING' && (r.fromUniqueId || '').trim().toUpperCase() === normUser);
+    const reversePending = fromRequests.find(r => (r.status === 'PENDING' || r.status === 'ACCEPTED') && (r.fromUniqueId || '').trim().toUpperCase() === normUser);
     if (reversePending) {
       reversePending.status = 'ACCEPTED';
       reversePending.updatedAt = new Date().toISOString();
     }
 
-    // Atomically establish permanent reciprocal friendship in database
+    // 1. Establish Canonical Unordered Friendship Pair (min::max)
+    const pair = this.getCanonicalPair(normUser, normFrom);
+    if (pair) {
+      this.data.friendships = this.data.friendships || {};
+      if (!this.data.friendships[pair]) {
+        const [uMin, uMax] = pair.split('::');
+        this.data.friendships[pair] = {
+          id: `frnd_${pair}`,
+          userA: uMin,
+          userB: uMax,
+          createdAt: new Date().toISOString()
+        };
+      }
+    }
+
+    // 2. Synchronize directional lookups for fast retrieval
     this.data.friends[normUser] = this.data.friends[normUser] || [];
     this.data.friends[normFrom] = this.data.friends[normFrom] || [];
 
-    if (!this.data.friends[normUser].includes(normFrom)) {
+    if (!this.data.friends[normUser].some(f => (f || '').toUpperCase() === normFrom)) {
       this.data.friends[normUser].push(normFrom);
     }
-    if (!this.data.friends[normFrom].includes(normUser)) {
+    if (!this.data.friends[normFrom].some(f => (f || '').toUpperCase() === normUser)) {
       this.data.friends[normFrom].push(normUser);
     }
 
-    this.saveData();
+    this.saveData(); // Authoritative DB commit
     return { success: true, user, fromUser };
   }
 
@@ -531,10 +615,36 @@ class StoreService {
   getFriendsList(uniqueId) {
     if (!uniqueId) return [];
     const normId = uniqueId.trim().toUpperCase();
-    const friendIds = this.data.friends[normId] || [];
-    return friendIds.map(fId => {
+
+    // Query canonical friendships + directional cache with deduplication
+    const friendIdSet = new Set();
+
+    if (this.data.friendships) {
+      for (const f of Object.values(this.data.friendships)) {
+        if (f.userA === normId) friendIdSet.add(f.userB);
+        else if (f.userB === normId) friendIdSet.add(f.userA);
+      }
+    }
+
+    if (this.data.friends && this.data.friends[normId]) {
+      for (const fId of this.data.friends[normId]) {
+        if (fId) friendIdSet.add(fId.trim().toUpperCase());
+      }
+    }
+
+    return Array.from(friendIdSet).map(fId => {
       const u = this.findUserByUniqueId(fId);
-      return u ? { uniqueId: u.uniqueId, name: u.name, avatar: u.avatar, trophies: u.trophies } : { uniqueId: fId, name: 'Bidder' };
+      return u ? {
+        uniqueId: u.uniqueId,
+        name: u.name,
+        avatar: u.avatar || 'avatar_1',
+        trophies: u.trophies || 0
+      } : {
+        uniqueId: fId,
+        name: 'Bidder',
+        avatar: 'avatar_1',
+        trophies: 0
+      };
     });
   }
 
@@ -734,6 +844,9 @@ class StoreService {
   syncOfflineBatch(identifier, data) {
     if (!identifier || !data) return null;
     const cleanId = String(identifier).trim();
+    if (!cleanId || cleanId.includes('..') || ['__proto__', 'constructor', 'prototype'].includes(cleanId.toLowerCase())) {
+      return null;
+    }
     let user = this.findUserByUniqueId(cleanId);
     if (!user && this.data.users[cleanId]) {
       user = this.data.users[cleanId];
@@ -753,35 +866,98 @@ class StoreService {
     this.data.matchHistory[canonicalKey] = this.data.matchHistory[canonicalKey] || [];
     this.data.trophyLedger[canonicalKey] = this.data.trophyLedger[canonicalKey] || [];
 
-    // 1. Ingest matches idempotently
+    const VALID_CATEGORIES = ['ipl_cricket', 'fifa_football', 'formula_1', 'nba', 'movie_stars', 'luxury_cars', 'luxury_collection'];
+
+    // 1. Ingest offline matches idempotently with strict server-side validation
+    // Disallow online matches via offline sync and disallow unverified trophies
     if (Array.isArray(data.matches)) {
       for (const m of data.matches) {
+        if (!m || typeof m !== 'object') continue;
         const mId = m.matchId || m.id;
-        if (mId && !this.data.matchHistory[canonicalKey].some(existing => (existing.matchId || existing.id) === mId)) {
-          this.data.matchHistory[canonicalKey].unshift({
-            ...m,
-            matchId: mId,
+        if (!mId || typeof mId !== 'string') continue;
+
+        // Security Enforcement: Offline sync ONLY allows offline / computer mode matches
+        const mode = (m.mode || '').toLowerCase();
+        if (mode !== 'computer' && mode !== 'offline') {
+          console.warn(`[SYNC_REJECTED] Attempted to sync non-offline match mode: ${m.mode}`);
+          continue;
+        }
+
+        // Validate category
+        const cat = m.category || 'ipl_cricket';
+        if (!VALID_CATEGORIES.includes(cat)) {
+          console.warn(`[SYNC_REJECTED] Invalid category in offline match: ${cat}`);
+          continue;
+        }
+
+        // Validate squad & budget
+        const budget = Number(m.budget);
+        if (isNaN(budget) || budget < 10 || budget > 500) {
+          continue;
+        }
+        if (!Array.isArray(m.squad) || m.squad.length === 0) {
+          continue;
+        }
+
+        // Validate spending within budget
+        const totalSpent = m.squad.reduce((sum, item) => sum + (Number(item.soldPrice || item.basePrice || item.price) || 0), 0);
+        if (totalSpent > budget * 1.05) { // allow 5% rounding tolerance
+          console.warn(`[SYNC_REJECTED] Squad spending (${totalSpent}) exceeds budget (${budget})`);
+          continue;
+        }
+
+        const isWinner = !!m.isWinner && Number(m.rank) === 1;
+
+        if (!this.data.matchHistory[canonicalKey].some(existing => (existing.matchId || existing.id) === mId)) {
+          const sanitizedMatch = {
             id: mId,
-            date: m.completedAt || m.date || new Date().toISOString(),
-          });
+            matchId: mId,
+            mode: 'computer',
+            category: cat,
+            categoryTitle: m.categoryTitle || cat,
+            budget,
+            squad: m.squad,
+            rank: isWinner ? 1 : (Number(m.rank) || 2),
+            isWinner,
+            trophyEarned: isWinner ? 1 : 0,
+            date: m.completedAt || m.date || new Date().toISOString()
+          };
+
+          this.data.matchHistory[canonicalKey].unshift(sanitizedMatch);
+          if (this.data.matchHistory[canonicalKey].length > 100) {
+            this.data.matchHistory[canonicalKey] = this.data.matchHistory[canonicalKey].slice(0, 100);
+          }
+
           if (user) {
             user.matchesPlayed = (user.matchesPlayed || 0) + 1;
-            if (m.isWinner) {
+            if (isWinner) {
               user.auctionsWon = (user.auctionsWon || 0) + 1;
+            }
+          }
+
+          // Authoritative trophy derivation from verified victory
+          if (isWinner) {
+            const trophyId = `trophy_${mId}_champion`;
+            if (!this.data.trophyLedger[canonicalKey].some(existing => existing.trophyId === trophyId)) {
+              this.data.trophyLedger[canonicalKey].push({
+                trophyId,
+                playerId: canonicalKey,
+                matchId: mId,
+                trophyType: 'CHAMPION',
+                trophyName: `${m.categoryTitle || cat} Champion`,
+                earnedAt: sanitizedMatch.date,
+                category: cat,
+                gameMode: 'computer',
+                createdAt: new Date().toISOString()
+              });
             }
           }
         }
       }
     }
 
-    // 2. Ingest trophies idempotently
-    if (Array.isArray(data.trophies)) {
-      for (const t of data.trophies) {
-        if (t && t.trophyId && !this.data.trophyLedger[canonicalKey].some(existing => existing.trophyId === t.trophyId)) {
-          this.data.trophyLedger[canonicalKey].push(t);
-        }
-      }
-    }
+    // 2. Direct raw data.trophies injection is rejected!
+    // (Trophies must ONLY be derived from the authoritative verified matches above)
 
     // 3. Reconcile user profile stats
     if (user) {
@@ -812,8 +988,8 @@ class StoreService {
           ledgerCounts[t.category] = (ledgerCounts[t.category] || 0) + 1;
         }
       }
-      for (const cat of Object.keys(ledgerCounts)) {
-        user.categoryTrophies[cat] = Math.max(ledgerCounts[cat], user.categoryTrophies[cat] || 0);
+      for (const c of Object.keys(ledgerCounts)) {
+        user.categoryTrophies[c] = ledgerCounts[c];
       }
       user.trophies = Object.values(user.categoryTrophies).reduce((sum, val) => sum + (val || 0), 0);
     }
@@ -1019,6 +1195,15 @@ class StoreService {
       delete this.data.friends[uId];
       delete this.data.friendRequests[uId];
       delete this.data.matchHistory[uId];
+    }
+
+    // Clean friendships for all purged IDs
+    if (this.data.friendships) {
+      for (const [pairKey, friendship] of Object.entries(this.data.friendships)) {
+        if (idsToPurge.has((friendship.userA || '').toUpperCase()) || idsToPurge.has((friendship.userB || '').toUpperCase())) {
+          delete this.data.friendships[pairKey];
+        }
+      }
     }
 
     // Clean friends lists of all remaining users

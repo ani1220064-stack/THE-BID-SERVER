@@ -211,22 +211,6 @@ async function verifyGoogleToken(token) {
       }
       return info;
     } catch (secErr) {
-      // Fallback: If it's a JWT, parse claims from payload
-      try {
-        const parts = token.split('.');
-        if (parts.length === 3) {
-          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-          if (payload && (payload.sub || payload.id)) {
-            console.warn('[AUTH] Resolved claims directly from JWT token payload');
-            return {
-              sub: payload.sub || payload.id,
-              email: payload.email || null,
-              name: payload.name || payload.given_name || 'Google Player',
-              picture: payload.picture || 'avatar_1'
-            };
-          }
-        }
-      } catch (parseErr) {}
       throw primaryErr;
     }
   }
@@ -288,16 +272,17 @@ function broadcastPresenceChange(uniqueId) {
   const hasSockets = userSockets.has(normId) && userSockets.get(normId).size > 0;
   const status = roomManager.getUserPresence(normId, hasSockets);
 
-  // Broadcast to all of the user's friends
+  // Broadcast to all of the user's permanent friends
   const user = store.findUserByUniqueId(normId);
-  if (!user) return;
-  const friends = store.data.friends[user.uniqueId] || [];
+  const friends = store.getFriendsList(normId);
 
-  for (const friendId of friends) {
-    emitToUser(friendId, 'friend_presence_updated', {
-      uniqueId: user.uniqueId,
-      status
-    });
+  for (const friend of friends) {
+    if (friend.uniqueId) {
+      emitToUser(friend.uniqueId, 'friend_presence_updated', {
+        uniqueId: (user && user.uniqueId) ? user.uniqueId : normId,
+        status
+      });
+    }
   }
 }
 
@@ -538,7 +523,10 @@ app.post('/api/friends/search', (req, res) => {
 });
 
 app.post('/api/friends/request', (req, res) => {
-  const { fromUniqueId, toUniqueId } = req.body;
+  const { fromUniqueId, toUniqueId } = req.body || {};
+  if (!fromUniqueId || !toUniqueId || typeof fromUniqueId !== 'string' || typeof toUniqueId !== 'string') {
+    return res.status(400).json({ error: 'fromUniqueId and toUniqueId are required strings' });
+  }
   const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
 
   if (result.success && !result.autoAccepted && result.request) {
@@ -590,13 +578,18 @@ app.post('/api/friends/request', (req, res) => {
     emitToUser(toUniqueId, 'friend_request_accepted', payload1);
     emitToUser(fromUniqueId, 'friendship_created', payload2);
     emitToUser(fromUniqueId, 'friend_request_accepted', payload2);
+    broadcastPresenceChange(fromUniqueId);
+    broadcastPresenceChange(toUniqueId);
   }
 
   res.json(result);
 });
 
 app.post('/api/friends/accept', (req, res) => {
-  const { userUniqueId, fromUniqueId } = req.body;
+  const { userUniqueId, fromUniqueId } = req.body || {};
+  if (!userUniqueId || !fromUniqueId || typeof userUniqueId !== 'string' || typeof fromUniqueId !== 'string') {
+    return res.status(400).json({ error: 'userUniqueId and fromUniqueId are required strings' });
+  }
   const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
   if (result.success) {
     console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
@@ -618,12 +611,17 @@ app.post('/api/friends/accept', (req, res) => {
     emitToUser(fromUniqueId, 'friend_request_accepted', payload1);
     emitToUser(userUniqueId, 'friendship_created', payload2);
     emitToUser(userUniqueId, 'friend_request_accepted', payload2);
+    broadcastPresenceChange(userUniqueId);
+    broadcastPresenceChange(fromUniqueId);
   }
   res.json(result);
 });
 
 app.post('/api/friends/decline', (req, res) => {
-  const { userUniqueId, fromUniqueId } = req.body;
+  const { userUniqueId, fromUniqueId } = req.body || {};
+  if (!userUniqueId || !fromUniqueId || typeof userUniqueId !== 'string' || typeof fromUniqueId !== 'string') {
+    return res.status(400).json({ error: 'userUniqueId and fromUniqueId are required strings' });
+  }
   const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
   if (result.success) {
     console.log('[FRIEND_REQUEST_DECLINED]', JSON.stringify({
@@ -768,9 +766,27 @@ io.on('connection', (socket) => {
   socket.on('register_user', ({ user }) => {
     if (!user || (!user.uniqueId && !user.id)) return;
     const normId = (user.uniqueId || user.id).trim().toUpperCase();
+
+    // Ensure user record exists and is indexed in store so search & friends work immediately
+    store.getOrCreateUser(user);
+
     registerUserSocket(normId, socket.id);
     broadcastPresenceChange(normId);
     console.log(`[Socket] Registered user ${normId} to socket ${socket.id}`);
+
+    // Send current presence of all permanent friends to this client
+    const friends = store.getFriendsList(normId);
+    for (const f of friends) {
+      if (f.uniqueId) {
+        const fNorm = f.uniqueId.trim().toUpperCase();
+        const fHasSockets = userSockets.has(fNorm) && userSockets.get(fNorm).size > 0;
+        const fStatus = roomManager.getUserPresence(fNorm, fHasSockets);
+        socket.emit('friend_presence_updated', {
+          uniqueId: f.uniqueId,
+          status: fStatus
+        });
+      }
+    }
 
     // Check for any pending room invitations upon connecting/registering
     const pendingInvites = store.getPendingInvitations(normId);
@@ -946,10 +962,10 @@ io.on('connection', (socket) => {
     } = payload || {};
 
     const user = rawUser ? { ...rawUser } : { id: socket.id, name: 'Host', uniqueId: 'TB-HOST', avatar: 'avatar_1' };
+    let hostNormId = null;
     if (user.uniqueId) {
-      const normId = user.uniqueId.trim().toUpperCase();
-      registerUserSocket(normId, socket.id);
-      broadcastPresenceChange(normId);
+      hostNormId = user.uniqueId.trim().toUpperCase();
+      registerUserSocket(hostNormId, socket.id);
     }
 
     const roomId = `room_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 4)}`;
@@ -974,6 +990,11 @@ io.on('connection', (socket) => {
     socket.emit('room_created', { roomId: room.id, roomCode: room.roomCode });
     roomManager.broadcastRoomState(room);
 
+    // Broadcast updated presence (BUSY) now that room is created
+    if (hostNormId) {
+      broadcastPresenceChange(hostNormId);
+    }
+
     // If host invited real friends during participant setup, create authentic server-side room invitations
     if (Array.isArray(customParticipants)) {
       customParticipants.forEach(p => {
@@ -995,10 +1016,10 @@ io.on('connection', (socket) => {
   socket.on('join_room', (payload = {}) => {
     const { roomId, roomCode, user: rawUser } = payload || {};
     const user = rawUser ? { ...rawUser } : { id: socket.id, name: 'Bidder', uniqueId: 'TB-BIDDER', avatar: 'avatar_1' };
+    let userNormId = null;
     if (user.uniqueId) {
-      const normId = user.uniqueId.trim().toUpperCase();
-      registerUserSocket(normId, socket.id);
-      broadcastPresenceChange(normId);
+      userNormId = user.uniqueId.trim().toUpperCase();
+      registerUserSocket(userNormId, socket.id);
     }
 
     const codeOrId = roomCode || roomId;
@@ -1018,6 +1039,11 @@ io.on('connection', (socket) => {
       category: result.room.category
     });
     roomManager.broadcastRoomState(result.room);
+
+    // Broadcast updated presence (BUSY) now that user joined room
+    if (userNormId) {
+      broadcastPresenceChange(userNormId);
+    }
   });
 
   // Direct Room Invitation System (Authoritative)
@@ -1028,13 +1054,16 @@ io.on('connection', (socket) => {
       socket.emit('error_message', { message: 'Room not found or expired.' });
       return;
     }
-    if (room.hostId !== user.id && room.hostId !== user.uniqueId && room.hostUser?.uniqueId !== user.uniqueId) {
+
+    const senderUniqueId = (user.uniqueId || user.id).trim().toUpperCase();
+    const hostParticipant = room.participants.get(user.id) || Array.from(room.participants.values()).find(p => p.uniqueId && p.uniqueId.toUpperCase() === senderUniqueId);
+    const isHost = (room.hostId === user.id || room.hostId === senderUniqueId || (hostParticipant && hostParticipant.isHost) || (room.hostUser && room.hostUser.uniqueId === senderUniqueId));
+    if (!isHost) {
       socket.emit('error_message', { message: 'Only the room host can invite players.' });
       return;
     }
 
     const normFriend = friendUniqueId.trim().toUpperCase();
-    const senderUniqueId = (user.uniqueId || user.id).trim().toUpperCase();
 
     // Verification 1: Verify sender and recipient are permanent friends
     if (!store.areFriends(senderUniqueId, normFriend)) {
@@ -1196,21 +1225,21 @@ io.on('connection', (socket) => {
   // Budget Update in Participant Setup (Host updates budget in real-time)
   socket.on('budget_update', ({ roomId, userId, amount, budget }) => {
     const val = amount !== undefined ? amount : budget;
-    roomManager.proposeBudget(roomId, userId, val);
+    roomManager.proposeBudget(roomId, userId, val, { callerSocketId: socket.id });
   });
 
   socket.on('propose_budget', ({ roomId, userId, amount, budget }) => {
     const val = amount !== undefined ? amount : budget;
-    roomManager.proposeBudget(roomId, userId, val);
+    roomManager.proposeBudget(roomId, userId, val, { callerSocketId: socket.id });
   });
 
   socket.on('vote_budget', ({ roomId, userId, agreed }) => {
-    roomManager.voteBudget(roomId, userId, agreed);
+    roomManager.voteBudget(roomId, userId, agreed, { callerSocketId: socket.id });
   });
 
   // Live Roster Sync: Add computer bot
   socket.on('add_bot', ({ roomId, userId, bot }) => {
-    const result = roomManager.addBot(roomId, userId, bot || {});
+    const result = roomManager.addBot(roomId, userId, bot || {}, { callerSocketId: socket.id });
     if (!result.success) {
       socket.emit('error_message', { message: result.message });
     }
@@ -1218,7 +1247,7 @@ io.on('connection', (socket) => {
 
   // Live Roster Sync: Remove opponent/bot
   socket.on('remove_participant', ({ roomId, userId, participantId }) => {
-    const result = roomManager.removeParticipant(roomId, userId, participantId);
+    const result = roomManager.removeParticipant(roomId, userId, participantId, { callerSocketId: socket.id });
     if (!result.success) {
       socket.emit('error_message', { message: result.message });
     }
@@ -1227,7 +1256,7 @@ io.on('connection', (socket) => {
   // Confirm Setup from ParticipantSetupScreen (Host confirms -> Both advance to Lobby)
   const handleSetupComplete = (payload = {}) => {
     const { roomId, userId, budget, participants, poolSize, aiDifficulty } = payload;
-    const result = roomManager.confirmSetup(roomId, userId, { budget, participants, poolSize, aiDifficulty });
+    const result = roomManager.confirmSetup(roomId, userId, { budget, participants, poolSize, aiDifficulty }, { callerSocketId: socket.id });
     if (!result.success) {
       socket.emit('error_message', { message: result.message });
     }
@@ -1249,11 +1278,11 @@ io.on('connection', (socket) => {
   socket.on('select_entity', handleSelectTeam);
 
   socket.on('toggle_ready', ({ roomId, userId, teamName }) => {
-    roomManager.toggleReady(roomId, userId, teamName);
+    roomManager.toggleReady(roomId, userId, teamName, { callerSocketId: socket.id });
   });
 
   socket.on('start_auction', ({ roomId, userId }) => {
-    roomManager.startAuction(roomId, userId);
+    roomManager.startAuction(roomId, userId, { callerSocketId: socket.id });
   });
 
   // Live Bidding (Screen 18)
@@ -1294,14 +1323,14 @@ io.on('connection', (socket) => {
     if (!text || typeof text !== 'string') return;
     const cleanText = text.replace(/<[^>]*>/g, '').trim().slice(0, 50);
     if (cleanText.length > 0) {
-      roomManager.broadcastReaction(roomId, userId, cleanText);
+      roomManager.broadcastReaction(roomId, userId, cleanText, { callerSocketId: socket.id });
     }
   });
 
   // Universal FINISH AUCTION Consensus System (Parallel Voting)
   socket.on('request_finish_auction', ({ roomId, userId }) => {
     if (!roomId || !userId) return;
-    const result = roomManager.requestFinishAuction(roomId, userId);
+    const result = roomManager.requestFinishAuction(roomId, userId, { callerSocketId: socket.id });
     if (!result.success) {
       socket.emit('error_message', { message: result.message });
     }
@@ -1309,7 +1338,7 @@ io.on('connection', (socket) => {
 
   socket.on('vote_finish_auction', ({ roomId, userId, agreed }) => {
     if (!roomId || !userId) return;
-    const result = roomManager.voteFinishAuction(roomId, userId, !!agreed);
+    const result = roomManager.voteFinishAuction(roomId, userId, !!agreed, { callerSocketId: socket.id });
     if (!result.success) {
       socket.emit('error_message', { message: result.message });
     }
@@ -1352,3 +1381,6 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[Server UnhandledRejection]', reason);
 });
+
+module.exports = { app, server, io, roomManager };
+

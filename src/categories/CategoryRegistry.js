@@ -595,40 +595,19 @@ const NBA_CATEGORY_MODULE = {
   }
 };
 
-// Helper to ensure 100% explicit separation of Auctioned Person vs Movie Context
+// Helper to ensure authoritative separate fields for Movie Stars talent without inference
 function enrichMovieTalent(item) {
   if (!item) return item;
-  const personName = item.auctionedPersonName || item.name;
-  const roleRaw = item.auctionedPersonRole || item.role || 'Talent';
-  
-  let roleNorm = roleRaw.toUpperCase();
-  if (roleRaw === 'Male Actor' || roleRaw === 'Female Actor') {
-    roleNorm = 'LEAD ACTOR';
-  } else if (roleRaw === 'Male Singer' || roleRaw === 'Female Singer') {
-    roleNorm = 'PLAYBACK SINGER';
-  } else if (roleRaw.toLowerCase() === 'director') {
-    roleNorm = 'DIRECTOR';
-  } else if (roleRaw.toLowerCase() === 'producer') {
-    roleNorm = 'PRODUCER';
-  }
-
-  const movie = item.movieTitle || (item.notableWorks && item.notableWorks[0]) || 'Feature Film';
-  const director = item.directorName || (roleNorm === 'DIRECTOR' ? personName : 'Visionary Director');
-  const producer = item.producerName || (roleNorm === 'PRODUCER' ? personName : 'Executive Producer');
-  const leadActor = item.leadActorName || (roleNorm === 'LEAD ACTOR' ? personName : (item.notableWorks && item.notableWorks[1]) || 'Ensemble Lead');
-  const studio = item.studioName || (item.industry ? `${item.industry} Studios` : 'Premier Film Studio');
-  const castList = Array.isArray(item.cast) ? item.cast : (item.notableWorks || []);
-
   return {
     ...item,
-    auctionedPersonName: personName,
-    auctionedPersonRole: roleNorm,
-    movieTitle: movie,
-    directorName: director,
-    producerName: producer,
-    leadActorName: leadActor,
-    studioName: studio,
-    cast: castList
+    auctionedPersonName: item.auctionedPersonName || item.name,
+    auctionedPersonRole: item.auctionedPersonRole || item.role,
+    movieTitle: item.movieTitle,
+    directorName: item.directorName,
+    producerName: item.producerName,
+    leadActorName: item.leadActorName,
+    studioName: item.studioName,
+    cast: item.cast || []
   };
 }
 
@@ -791,8 +770,8 @@ const MOVIE_STARS_CATEGORY_MODULE = {
     'Skydance Media', 'Village Roadshow'
   ],
   fictionalManagers: [
-    'Studio Chief AI', 'Executive Producer V', 'Auteur Director K', 'Greenlight Mogul',
-    'Casting Director R', 'Studio Head M', 'Festival Programmer S', 'Distributor D'
+    'Kabir Roy', 'Rohan Varma', 'Dev Malhotra', 'Arjun Vale',
+    'Aarav Sen', 'Sameer Joshi', 'Aditya Roy', 'Kunal Singhania'
   ],
   generateBots: (count, existingNames, existingTeams) => {
     return generateFictionalBots(count, existingNames, existingTeams);
@@ -987,8 +966,9 @@ const MOVIE_STARS_CATEGORY_MODULE = {
         },
         strengths: strengths.length > 0 ? strengths : ['Cohesive cinematic package with steady production values'],
         weaknesses: weaknesses.length > 0 ? weaknesses : ['Masterpiece package with zero glaring structural production flaws'],
-        bestBargain: bargain ? `${bargain.auctionedPersonName || bargain.name} (${symbol}${bargain.soldPrice.toFixed(1)} ${unit})` : 'N/A',
-        marqueeSigning: biggestSplash ? `${biggestSplash.auctionedPersonName || biggestSplash.name} (${symbol}${biggestSplash.soldPrice.toFixed(1)} ${unit})` : 'N/A',
+        bestBargain: bargain ? (bargain.auctionedPersonName || bargain.name) : 'None',
+        marqueeSigning: biggestSplash ? (biggestSplash.auctionedPersonName || biggestSplash.name) : 'None',
+        headlineSigning: biggestSplash ? (biggestSplash.auctionedPersonName || biggestSplash.name) : 'None',
         compositionSummary: `${movieTitle} • Directed by ${leadDirector ? leadDirector.name : 'Uncredited'} • ${cast.length} Talent signed`,
         spent,
         remainingPurse: Math.round(p.purse * 10) / 10

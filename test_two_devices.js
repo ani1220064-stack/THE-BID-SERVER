@@ -1,5 +1,6 @@
 const io = require('socket.io-client');
 const http = require('http');
+const { server } = require('./src/index');
 
 const SERVER_URL = 'http://127.0.0.1:4000';
 

@@ -166,8 +166,9 @@ class RoomManager {
     // Slot #1 is always Host ("Me") — permanently locked & cannot be removed
     let hostFranchise = null;
     const hostUniqueId = hostUser ? (hostUser.uniqueId || hostUser.bidId || hostUser.id) : null;
+    let hostCustom = null;
     if (Array.isArray(customParticipants)) {
-      const hostCustom = customParticipants.find(p => p.id === hostUser.id || p.type === 'HOST');
+      hostCustom = customParticipants.find(p => p.id === hostUser.id || p.type === 'HOST');
       if (hostCustom && (hostCustom.teamId || hostCustom.teamName)) {
         hostFranchise = getCategoryFranchise(categoryModule, hostCustom.teamId, hostUniqueId) || 
                         getCategoryFranchise(categoryModule, hostCustom.teamName, hostUniqueId);
@@ -175,8 +176,17 @@ class RoomManager {
     }
     if (!hostFranchise && hostUser) {
       hostFranchise = getCategoryFranchise(categoryModule, hostUser.teamId, hostUniqueId) || 
-                      getCategoryFranchise(categoryModule, hostUser.teamName, hostUniqueId) || 
-                      categoryFranchises[0];
+                      getCategoryFranchise(categoryModule, hostUser.teamName, hostUniqueId);
+    }
+    const specifiedHostTeam = (hostCustom && hostCustom.teamName) || (hostUser && hostUser.teamName);
+    if (!hostFranchise && specifiedHostTeam) {
+      hostFranchise = {
+        id: (hostCustom && hostCustom.teamId) || (hostUser && hostUser.teamId) || `custom_${Date.now().toString(36)}`,
+        name: specifiedHostTeam,
+        isCustom: true
+      };
+    } else if (!hostFranchise) {
+      hostFranchise = categoryFranchises[0];
     }
     if (hostFranchise) {
       room.teamOwnership.set(hostFranchise.id, hostUser.id);
@@ -281,6 +291,13 @@ class RoomManager {
               friendFranchise = f;
             }
           }
+          if (!friendFranchise && p.teamName) {
+            friendFranchise = {
+              id: p.teamId || `custom_${Date.now().toString(36)}_${idx}`,
+              name: p.teamName,
+              isCustom: true
+            };
+          }
           if (friendFranchise) {
             room.teamOwnership.set(friendFranchise.id, p.id);
           }
@@ -307,7 +324,8 @@ class RoomManager {
     } else if (mode === 'computer') {
       // Configurable or default bot opponents (up to 9 opponents: 1 host + 9 bots = 10 total)
       const countToGenerate = Math.min(9, Math.max(1, (participantCount ? participantCount - 1 : 3)));
-      const fictionalBots = generateFictionalBots(countToGenerate, [], [], room.aiDifficulty);
+      const categoryManagers = categoryModule.fictionalManagers || [];
+      const fictionalBots = generateFictionalBots(countToGenerate, [], [], room.aiDifficulty, categoryManagers);
       fictionalBots.forEach((botProfile, idx) => {
         const botFranchise = categoryFranchises.find(f => !room.teamOwnership.has(f.id));
         const botId = botProfile.id || `bot_${Date.now().toString(36)}_${idx}`;
@@ -824,13 +842,19 @@ class RoomManager {
   }
 
   // Handle Starting Budget Negotiation (Screens 12 & 13 & Lobby Re-negotiation)
-  proposeBudget(roomId, userId, newBudget) {
+  proposeBudget(roomId, userId, newBudget, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || (room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION' && room.state !== 'LOBBY')) return;
 
+    const participant = room.participants.get(userId);
+    if (!participant) return;
+    if (options.callerSocketId && participant.socketId && participant.socketId !== options.callerSocketId) {
+      return;
+    }
+
     // Security Hardening: Validate proposed budget within legitimate bounds
     const budget = Math.round(Number(newBudget) * 10) / 10;
-    if (isNaN(budget) || budget < 10 || budget > 500) {
+    if (isNaN(budget) || !isFinite(budget) || budget < 10 || budget > 500) {
       return;
     }
 
@@ -857,9 +881,15 @@ class RoomManager {
     this.broadcastRoomState(room);
   }
 
-  voteBudget(roomId, userId, agreed) {
+  voteBudget(roomId, userId, agreed, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || room.state !== 'BUDGET_SELECTION') return;
+
+    const participant = room.participants.get(userId);
+    if (!participant) return;
+    if (options.callerSocketId && participant.socketId && participant.socketId !== options.callerSocketId) {
+      return;
+    }
 
     room.budgetVotes.set(userId, !!agreed);
 
@@ -884,10 +914,14 @@ class RoomManager {
   }
 
   // Live Roster Sync: Host adds bot in SETUP phase
-  addBot(roomId, userId, botData = {}) {
+  addBot(roomId, userId, botData = {}, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || room.state !== 'SETUP') return { success: false, message: 'Invalid room state.' };
-    if (room.hostId !== userId) return { success: false, message: 'Only host can add bots.' };
+    const hostPart = room.participants.get(userId);
+    if (room.hostId !== userId && (!hostPart || !hostPart.isHost)) return { success: false, message: 'Only host can add bots.' };
+    if (options.callerSocketId && hostPart && hostPart.socketId && hostPart.socketId !== options.callerSocketId) {
+      return { success: false, message: 'Unauthorized caller.' };
+    }
     if (room.participants.size >= 10) return { success: false, message: 'Maximum 10 participants reached.' };
 
     const categoryModule = CategoryRegistry.get(room.category);
@@ -957,10 +991,14 @@ class RoomManager {
   }
 
   // Live Roster Sync: Host removes participant/bot in SETUP phase
-  removeParticipant(roomId, userId, participantId) {
+  removeParticipant(roomId, userId, participantId, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || room.state !== 'SETUP') return { success: false, message: 'Invalid room state.' };
-    if (room.hostId !== userId) return { success: false, message: 'Only host can remove participants.' };
+    const hostPart = room.participants.get(userId);
+    if (room.hostId !== userId && (!hostPart || !hostPart.isHost)) return { success: false, message: 'Only host can remove participants.' };
+    if (options.callerSocketId && hostPart && hostPart.socketId && hostPart.socketId !== options.callerSocketId) {
+      return { success: false, message: 'Unauthorized caller.' };
+    }
     if (participantId === room.hostId) return { success: false, message: 'Cannot remove host.' };
 
     const part = room.participants.get(participantId);
@@ -987,11 +1025,15 @@ class RoomManager {
   }
 
   // Confirm Participant & Room Setup -> Advance directly to Lobby
-  confirmSetup(roomId, userId, { budget, participants, poolSize, aiDifficulty } = {}) {
+  confirmSetup(roomId, userId, { budget, participants, poolSize, aiDifficulty } = {}, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room) return { success: false, message: 'Room not found.' };
-    if (room.hostId !== userId) {
+    const hostPart = room.participants.get(userId);
+    if (room.hostId !== userId && (!hostPart || !hostPart.isHost)) {
       return { success: false, message: 'Only the room host can confirm setup.' };
+    }
+    if (options.callerSocketId && hostPart && hostPart.socketId && hostPart.socketId !== options.callerSocketId) {
+      return { success: false, message: 'Unauthorized caller.' };
     }
 
     if (budget && typeof budget === 'number' && budget >= 10 && budget <= 500) {
@@ -1169,60 +1211,66 @@ class RoomManager {
   }
 
   // Pre-Auction Lobby (Screen 14)
-  toggleReady(roomId, userId, teamName) {
+  toggleReady(roomId, userId, teamName, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || room.state !== 'LOBBY') return;
 
     const p = room.participants.get(userId);
-    if (p) {
-      p.isReady = !p.isReady;
-      if (teamName) {
-        const categoryModule = CategoryRegistry.get(room.category);
-        const franchise = getCategoryFranchise(categoryModule, teamName);
-        if (franchise) {
-          const currentOwner = room.teamOwnership ? room.teamOwnership.get(franchise.id) : null;
-          if (currentOwner && currentOwner !== userId) {
-            const ownerPart = room.participants.get(currentOwner);
-            if (ownerPart && ownerPart.isAI) {
-              const categoryFranchises = categoryModule.getFranchises ? categoryModule.getFranchises() : (categoryModule.franchises || []);
-              const unowned = categoryFranchises.find(f => f.id !== franchise.id && !room.teamOwnership.has(f.id));
-              if (unowned) {
-                room.teamOwnership.set(unowned.id, currentOwner);
-                ownerPart.teamId = unowned.id;
-                ownerPart.teamName = unowned.name;
-                const botObj = room.bots.find(b => b.id === currentOwner);
-                if (botObj) {
-                  botObj.teamId = unowned.id;
-                  botObj.teamName = unowned.name;
-                }
+    if (!p) return;
+    if (options.callerSocketId && p.socketId && p.socketId !== options.callerSocketId) {
+      return;
+    }
+    p.isReady = !p.isReady;
+    if (teamName) {
+      const categoryModule = CategoryRegistry.get(room.category);
+      const franchise = getCategoryFranchise(categoryModule, teamName);
+      if (franchise) {
+        const currentOwner = room.teamOwnership ? room.teamOwnership.get(franchise.id) : null;
+        if (currentOwner && currentOwner !== userId) {
+          const ownerPart = room.participants.get(currentOwner);
+          if (ownerPart && ownerPart.isAI) {
+            const categoryFranchises = categoryModule.getFranchises ? categoryModule.getFranchises() : (categoryModule.franchises || []);
+            const unowned = categoryFranchises.find(f => f.id !== franchise.id && !room.teamOwnership.has(f.id));
+            if (unowned) {
+              room.teamOwnership.set(unowned.id, currentOwner);
+              ownerPart.teamId = unowned.id;
+              ownerPart.teamName = unowned.name;
+              const botObj = room.bots.find(b => b.id === currentOwner);
+              if (botObj) {
+                botObj.teamId = unowned.id;
+                botObj.teamName = unowned.name;
               }
             }
           }
-          const updatedOwner = room.teamOwnership ? room.teamOwnership.get(franchise.id) : null;
-          if (!updatedOwner || updatedOwner === userId) {
-            if (room.teamOwnership) {
-              for (const [tId, uId] of room.teamOwnership.entries()) {
-                if (uId === userId) room.teamOwnership.delete(tId);
-              }
-              room.teamOwnership.set(franchise.id, userId);
-            }
-            p.teamId = franchise.id;
-            p.teamName = franchise.name;
-          }
-        } else {
-          p.teamName = teamName;
         }
+        const updatedOwner = room.teamOwnership ? room.teamOwnership.get(franchise.id) : null;
+        if (!updatedOwner || updatedOwner === userId) {
+          if (room.teamOwnership) {
+            for (const [tId, uId] of room.teamOwnership.entries()) {
+              if (uId === userId) room.teamOwnership.delete(tId);
+            }
+            room.teamOwnership.set(franchise.id, userId);
+          }
+          p.teamId = franchise.id;
+          p.teamName = franchise.name;
+        }
+      } else {
+        p.teamName = teamName;
       }
     }
 
     this.broadcastRoomState(room);
   }
 
-  startAuction(roomId, userId) {
+  startAuction(roomId, userId, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || (room.state !== 'LOBBY' && room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION')) return;
-    const isHost = (room.hostId === userId) || (room.participants.get(userId)?.isHost === true);
+    const hostPart = room.participants.get(userId);
+    const isHost = (room.hostId === userId) || (hostPart && hostPart.isHost === true);
     if (!isHost) return;
+    if (options.callerSocketId && hostPart && hostPart.socketId && hostPart.socketId !== options.callerSocketId) {
+      return;
+    }
 
     room.state = 'AUCTION_ACTIVE';
     room.currentPlayerIndex = 0;
@@ -1394,8 +1442,10 @@ class RoomManager {
     }
 
     // Validation:
-    // 1. Must be >= base price if first bid, or > currentBid
-    const minBid = room.currentBid === 0 ? player.basePrice : Math.round((room.currentBid + 0.1) * 10) / 10;
+    // 1. Must be >= base price if first bid, or >= currentBid + minimum allowable increment
+    const isCr = Boolean(room.categoryConfig && room.categoryConfig.unitLabel && room.categoryConfig.unitLabel.toLowerCase() === 'cr');
+    const minIncrement = isCr ? (room.currentBid < 1.0 ? 0.1 : 0.2) : 1.0;
+    const minBid = room.currentBid === 0 ? player.basePrice : Math.round((room.currentBid + minIncrement) * 10) / 10;
     if (amount < minBid) {
       const reason = `Bid of ₹${amount} was outbid. Current minimum bid is ₹${minBid}.`;
       console.log('[BID_REJECTED]', JSON.stringify({ auctionId: roomId, requestedAmount: amount, reason, currentBid: room.currentBid, minBid, bidVersion: room.bidVersion }));
@@ -1777,6 +1827,17 @@ class RoomManager {
 
     this.broadcastRoomState(room);
     this.io.to(room.id).emit('auction_finished', evaluation);
+
+    // Notify presence change: match has finished, participants return to AVAILABLE
+    room.participants.forEach(p => {
+      if (!p.isAI && p.uniqueId) {
+        const normU = p.uniqueId.trim().toUpperCase();
+        this.userLifecycle.set(normU, 'AVAILABLE');
+        if (this.onPresenceChanged) {
+          this.onPresenceChanged(normU);
+        }
+      }
+    });
   }
 
   // Signature AI Analysis Engine (Screen 29 & 30) - Delegated to Category Module
@@ -1821,11 +1882,15 @@ class RoomManager {
     this.io.to(room.id).emit('room_state', payload);
   }
 
-  broadcastReaction(roomId, userId, text) {
+  broadcastReaction(roomId, userId, text, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room) return;
     const participant = room.participants.get(userId);
-    const userName = participant ? (participant.name || participant.displayName || 'Bidder') : 'Bidder';
+    if (!participant) return;
+    if (options.callerSocketId && participant.socketId && participant.socketId !== options.callerSocketId) {
+      return;
+    }
+    const userName = participant.name || participant.displayName || 'Bidder';
     const rxPayload = {
       id: `rx_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       userId,
@@ -1855,8 +1920,8 @@ class RoomManager {
       if (p.isAI) {
         eligible.push({ id: pId, name: p.name, isAI: true });
       } else {
-        // Discard permanently departed or ghost participants
-        if (p.hasLeft || p.isGhost) {
+        // Discard permanently departed, disconnected or ghost participants
+        if (p.hasLeft || p.isGhost || p.isDisconnected) {
           continue;
         }
 
@@ -1864,11 +1929,6 @@ class RoomManager {
           const socketObj = this.io.sockets.sockets.get ? this.io.sockets.sockets.get(p.socketId) : this.io.sockets.sockets[p.socketId];
           const isConnected = socketObj && (socketObj.connected !== false);
           if (isConnected || !p.socketId) {
-            eligible.push({ id: pId, name: p.name, isAI: false, socketId: p.socketId });
-          } else if (p.isDisconnected) {
-            // Disconnected ghost: do not block consensus
-            continue;
-          } else {
             eligible.push({ id: pId, name: p.name, isAI: false, socketId: p.socketId });
           }
         } else {
@@ -1909,7 +1969,7 @@ class RoomManager {
     }
   }
 
-  requestFinishAuction(roomId, userId) {
+  requestFinishAuction(roomId, userId, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room) return { success: false, message: 'Room not found.' };
 
@@ -1918,17 +1978,20 @@ class RoomManager {
       return { success: false, message: 'Finish auction can only be requested during a live match.' };
     }
 
-    // Atomic concurrency handling: If another participant taps at the same time, record as AGREE vote
-    if (room.finishVoteState === 'FINISH_REQUESTED') {
-      if (room.finishVote && !room.finishVote.votes[userId]) {
-        return this.voteFinishAuction(roomId, userId, true);
-      }
-      return { success: true, alreadyRequested: true, room };
-    }
-
     const participant = room.participants.get(userId);
     if (!participant) {
       return { success: false, message: 'Participant not found in room.' };
+    }
+    if (options.callerSocketId && participant.socketId && participant.socketId !== options.callerSocketId) {
+      return { success: false, message: 'Unauthorized caller.' };
+    }
+
+    // Atomic concurrency handling: If another participant taps at the same time, record as AGREE vote
+    if (room.finishVoteState === 'FINISH_REQUESTED') {
+      if (room.finishVote && !room.finishVote.votes[userId]) {
+        return this.voteFinishAuction(roomId, userId, true, options);
+      }
+      return { success: true, alreadyRequested: true, room };
     }
 
     const eligible = this.getActiveEligibleParticipants(room);
@@ -1977,7 +2040,7 @@ class RoomManager {
     return { success: true, finished: false, room };
   }
 
-  voteFinishAuction(roomId, userId, agreed) {
+  voteFinishAuction(roomId, userId, agreed, options = {}) {
     const room = this.rooms.get(roomId);
     if (!room || room.finishVoteState !== 'FINISH_REQUESTED' || !room.finishVote) {
       return { success: false, message: 'No active finish auction request to vote on.' };
@@ -1986,6 +2049,9 @@ class RoomManager {
     const participant = room.participants.get(userId);
     if (!participant) {
       return { success: false, message: 'Participant not found.' };
+    }
+    if (options.callerSocketId && participant.socketId && participant.socketId !== options.callerSocketId) {
+      return { success: false, message: 'Unauthorized caller.' };
     }
 
     // 1. IGNORE BEHAVIOR: Any participant selecting IGNORE cancels request immediately
