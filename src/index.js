@@ -45,6 +45,18 @@ app.get('/', (req, res) => {
   res.status(200).json({ status: 'ok', product: 'THE BID', authoritative: true });
 });
 
+app.get('/api/system/version', (req, res) => {
+  res.json({
+    engine: 'THE_BID_FRIEND_SYSTEM_V2_AUTHORITATIVE',
+    version: '2.0.0',
+    buildDate: '2026-10-03',
+    commit: 'c95cfd9_rebuilt',
+    outboxSize: (store.data.outbox || []).length,
+    usersCount: Object.keys(store.data.users || {}).length,
+    friendshipsCount: Object.keys(store.data.friendships || {}).length
+  });
+});
+
 // In-Memory Sliding Window Rate Limiter
 const rateLimitMap = new Map();
 function rateLimiter(windowMs = 60000, maxRequests = 120) {
@@ -524,10 +536,11 @@ app.post('/api/friends/search', (req, res) => {
 
 app.post('/api/friends/request', (req, res) => {
   const { fromUniqueId, toUniqueId } = req.body || {};
+  const operationId = req.headers['x-operation-id'] || req.body?.operationId || null;
   if (!fromUniqueId || !toUniqueId || typeof fromUniqueId !== 'string' || typeof toUniqueId !== 'string') {
     return res.status(400).json({ error: 'fromUniqueId and toUniqueId are required strings' });
   }
-  const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
+  const result = store.sendFriendRequest(fromUniqueId, toUniqueId, operationId);
 
   if (result.success && !result.autoAccepted && result.request) {
     console.log('[FRIEND_REQUEST_CREATED]', JSON.stringify({
@@ -536,6 +549,7 @@ app.post('/api/friends/request', (req, res) => {
       senderUniqueId: fromUniqueId,
       recipientUserId: result.request.recipientUserId || toUniqueId,
       recipientUniqueId: toUniqueId,
+      operationId,
       timestamp: Date.now()
     }));
 
@@ -548,7 +562,8 @@ app.post('/api/friends/request', (req, res) => {
       fromAvatar: result.request.fromAvatar,
       trophies: result.fromUser ? (result.fromUser.trophies || 0) : 0,
       timestamp: Date.now(),
-      reNotified: !!result.reNotified
+      reNotified: !!result.reNotified,
+      outboxEventId: result.outboxEvent?.eventId || null
     };
     emitToUser(toUniqueId, 'friend_request_created', payload);
     emitToUser(toUniqueId, 'friend_request_received', payload);
@@ -587,14 +602,16 @@ app.post('/api/friends/request', (req, res) => {
 
 app.post('/api/friends/accept', (req, res) => {
   const { userUniqueId, fromUniqueId } = req.body || {};
+  const operationId = req.headers['x-operation-id'] || req.body?.operationId || null;
   if (!userUniqueId || !fromUniqueId || typeof userUniqueId !== 'string' || typeof fromUniqueId !== 'string') {
     return res.status(400).json({ error: 'userUniqueId and fromUniqueId are required strings' });
   }
-  const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
+  const result = store.acceptFriendRequest(userUniqueId, fromUniqueId, operationId);
   if (result.success) {
     console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
       userUniqueId,
       fromUniqueId,
+      operationId,
       timestamp: Date.now()
     }));
     const payload1 = {
@@ -619,14 +636,16 @@ app.post('/api/friends/accept', (req, res) => {
 
 app.post('/api/friends/decline', (req, res) => {
   const { userUniqueId, fromUniqueId } = req.body || {};
+  const operationId = req.headers['x-operation-id'] || req.body?.operationId || null;
   if (!userUniqueId || !fromUniqueId || typeof userUniqueId !== 'string' || typeof fromUniqueId !== 'string') {
     return res.status(400).json({ error: 'userUniqueId and fromUniqueId are required strings' });
   }
-  const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
+  const result = store.declineFriendRequest(userUniqueId, fromUniqueId, operationId);
   if (result.success) {
     console.log('[FRIEND_REQUEST_DECLINED]', JSON.stringify({
       userUniqueId,
       fromUniqueId,
+      operationId,
       timestamp: Date.now()
     }));
     emitToUser(fromUniqueId, 'friend_request_declined', {
@@ -800,6 +819,40 @@ io.on('connection', (socket) => {
       socket.emit('friend_requests_batch', pendingRequests);
     }
 
+    // Flush and reconcile pending transactional outbox events for this user
+    const pendingOutbox = store.getPendingOutboxEvents(normId);
+    for (const evt of pendingOutbox) {
+      if (evt.eventType === 'FRIEND_REQUEST_SENT') {
+        const payload = {
+          id: evt.payload.request?.id || evt.aggregateId,
+          requestId: evt.payload.request?.id || evt.aggregateId,
+          fromUniqueId: evt.payload.request?.fromUniqueId || evt.actorUserId,
+          fromName: evt.payload.request?.fromName || evt.payload.fromUser?.name || evt.actorUserId,
+          fromAvatar: evt.payload.request?.fromAvatar || evt.payload.fromUser?.avatar || 'avatar_1',
+          trophies: evt.payload.fromUser ? (evt.payload.fromUser.trophies || 0) : 0,
+          timestamp: new Date(evt.createdAt).getTime(),
+          outboxEventId: evt.eventId
+        };
+        socket.emit('friend_request_created', payload);
+        socket.emit('friend_request_received', payload);
+      } else if (evt.eventType === 'FRIEND_REQUEST_ACCEPTED') {
+        const payload = {
+          friendUniqueId: evt.actorUserId,
+          friendName: evt.payload.fromUser?.name || evt.actorUserId,
+          relationship: 'FRIENDS',
+          outboxEventId: evt.eventId
+        };
+        socket.emit('friendship_created', payload);
+        socket.emit('friend_request_accepted', payload);
+      } else if (evt.eventType === 'ROOM_INVITATION_SENT') {
+        socket.emit('room_invitation_received', {
+          ...evt.payload.invitation,
+          outboxEventId: evt.eventId
+        });
+      }
+      store.markOutboxEventDispatched(evt.eventId);
+    }
+
     // Reconnect to active room if player was in an ongoing game
     const activeRoom = roomManager.findActiveRoomForUser(user.id, normId);
     if (activeRoom) {
@@ -811,6 +864,12 @@ io.on('connection', (socket) => {
       }
       roomManager.broadcastRoomState(activeRoom);
       console.log(`[Socket] Re-synchronized active room ${activeRoom.id} for user ${normId}`);
+    }
+  });
+
+  socket.on('outbox_ack', ({ eventId }) => {
+    if (eventId) {
+      store.markOutboxEventDelivered(eventId);
     }
   });
 
@@ -845,8 +904,8 @@ io.on('connection', (socket) => {
   });
 
   // Real-Time Friend Request Socket Actions
-  socket.on('send_friend_request', ({ fromUniqueId, toUniqueId }) => {
-    const result = store.sendFriendRequest(fromUniqueId, toUniqueId);
+  socket.on('send_friend_request', ({ fromUniqueId, toUniqueId, operationId }) => {
+    const result = store.sendFriendRequest(fromUniqueId, toUniqueId, operationId);
     if (result.success && !result.autoAccepted && result.request) {
       console.log('[FRIEND_REQUEST_CREATED]', JSON.stringify({
         requestId: result.request.id,
@@ -854,6 +913,7 @@ io.on('connection', (socket) => {
         senderUniqueId: fromUniqueId,
         recipientUserId: result.request.recipientUserId || toUniqueId,
         recipientUniqueId: toUniqueId,
+        operationId,
         timestamp: Date.now()
       }));
 
@@ -865,7 +925,8 @@ io.on('connection', (socket) => {
         fromAvatar: result.request.fromAvatar,
         trophies: result.fromUser ? (result.fromUser.trophies || 0) : 0,
         timestamp: Date.now(),
-        reNotified: !!result.reNotified
+        reNotified: !!result.reNotified,
+        outboxEventId: result.outboxEvent?.eventId || null
       };
       emitToUser(toUniqueId, 'friend_request_created', payload);
       emitToUser(toUniqueId, 'friend_request_received', payload);
@@ -881,18 +942,21 @@ io.on('connection', (socket) => {
         senderUniqueId: fromUniqueId,
         recipientUniqueId: toUniqueId,
         autoAccepted: true,
+        operationId,
         timestamp: Date.now()
       }));
 
       const payload1 = {
         friendUniqueId: fromUniqueId,
         friendName: result.fromUser ? result.fromUser.name : fromUniqueId,
-        relationship: 'FRIENDS'
+        relationship: 'FRIENDS',
+        outboxEventId: result.outboxEvent?.eventId || null
       };
       const payload2 = {
         friendUniqueId: toUniqueId,
         friendName: result.targetUser ? result.targetUser.name : toUniqueId,
-        relationship: 'FRIENDS'
+        relationship: 'FRIENDS',
+        outboxEventId: result.outboxEvent?.eventId || null
       };
 
       emitToUser(toUniqueId, 'friendship_created', payload1);
@@ -904,25 +968,28 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('respond_friend_request', ({ userUniqueId, fromUniqueId, accept }) => {
+  socket.on('respond_friend_request', ({ userUniqueId, fromUniqueId, accept, operationId }) => {
     if (accept) {
-      const result = store.acceptFriendRequest(userUniqueId, fromUniqueId);
+      const result = store.acceptFriendRequest(userUniqueId, fromUniqueId, operationId);
       if (result.success) {
         console.log('[FRIEND_REQUEST_ACCEPTED]', JSON.stringify({
           userUniqueId,
           fromUniqueId,
+          operationId,
           timestamp: Date.now()
         }));
 
         const payload1 = {
           friendUniqueId: userUniqueId,
           friendName: result.user ? result.user.name : userUniqueId,
-          relationship: 'FRIENDS'
+          relationship: 'FRIENDS',
+          outboxEventId: result.outboxEvent?.eventId || null
         };
         const payload2 = {
           friendUniqueId: fromUniqueId,
           friendName: result.fromUser ? result.fromUser.name : fromUniqueId,
-          relationship: 'FRIENDS'
+          relationship: 'FRIENDS',
+          outboxEventId: result.outboxEvent?.eventId || null
         };
 
         emitToUser(fromUniqueId, 'friendship_created', payload1);
@@ -931,11 +998,12 @@ io.on('connection', (socket) => {
         emitToUser(userUniqueId, 'friend_request_accepted', payload2);
       }
     } else {
-      const result = store.declineFriendRequest(userUniqueId, fromUniqueId);
+      const result = store.declineFriendRequest(userUniqueId, fromUniqueId, operationId);
       if (result.success) {
         console.log('[FRIEND_REQUEST_DECLINED]', JSON.stringify({
           userUniqueId,
           fromUniqueId,
+          operationId,
           timestamp: Date.now()
         }));
         emitToUser(fromUniqueId, 'friend_request_declined', {
@@ -1047,7 +1115,7 @@ io.on('connection', (socket) => {
   });
 
   // Direct Room Invitation System (Authoritative)
-  socket.on('send_room_invite', ({ roomId, friendUniqueId, user }) => {
+  socket.on('send_room_invite', ({ roomId, friendUniqueId, user, operationId }) => {
     if (!roomId || !friendUniqueId || !user) return;
     const room = roomManager.getRoom(roomId);
     if (!room) {
@@ -1097,7 +1165,8 @@ io.on('connection', (socket) => {
       roomId: room.id,
       roomCode: room.roomCode || room.id,
       category: room.category,
-      categoryTitle: room.categoryConfig?.title || 'Auction Room'
+      categoryTitle: room.categoryConfig?.title || 'Auction Room',
+      operationId
     });
 
     console.log('[ROOM_INVITE_CREATED]', JSON.stringify({
@@ -1106,6 +1175,7 @@ io.on('connection', (socket) => {
       senderUniqueId,
       recipientUniqueId: normFriend,
       roomId: room.id,
+      operationId,
       timestamp: Date.now()
     }));
 

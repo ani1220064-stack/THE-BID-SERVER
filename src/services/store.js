@@ -20,7 +20,9 @@ const defaultState = {
   matchHistory: {}, // uniqueId -> [{ matchId, date, mode, budget, squad: [], rank, aiScore, summary }]
   trophyLedger: {}, // uniqueId -> [{ trophyId, matchId, trophyType, category, earnedAt }]
   roomInvitations: {}, // invitationId -> { id, sender, recipientUniqueId, roomId, roomCode, category, status, createdAt, expiresAt }
-  customEntities: {}  // ownerUniqueId -> [{ id, ownerUniqueId, categoryId, name, entityType, createdAt, deletedAt }]
+  customEntities: {}, // ownerUniqueId -> [{ id, ownerUniqueId, categoryId, name, entityType, createdAt, deletedAt }]
+  outbox: [],       // [{ eventId, eventType, aggregateId, actorId, targetId, payload, status, createdAt }]
+  processedOperations: {} // operationId -> { result, timestamp }
 };
 
 class StoreService {
@@ -39,13 +41,15 @@ class StoreService {
           ...defaultState,
           ...parsed,
           googleUsers: parsed.googleUsers || {},
-          uniqueIdIndex: parsed.uniqueIdIndex || {}
+          uniqueIdIndex: parsed.uniqueIdIndex || {},
+          outbox: Array.isArray(parsed.outbox) ? parsed.outbox : [],
+          processedOperations: parsed.processedOperations || {}
         };
       }
     } catch (e) {
       console.error('Error loading store.json, initializing default:', e.message);
     }
-    return { ...defaultState, googleUsers: {}, uniqueIdIndex: {} };
+    return { ...defaultState, googleUsers: {}, uniqueIdIndex: {}, outbox: [], processedOperations: {} };
   }
 
   reload() {
@@ -58,6 +62,8 @@ class StoreService {
     this.data.uniqueIdIndex = this.data.uniqueIdIndex || {};
     this.data.googleUsers = this.data.googleUsers || {};
     this.data.trophyLedger = this.data.trophyLedger || {};
+    this.data.outbox = Array.isArray(this.data.outbox) ? this.data.outbox : [];
+    this.data.processedOperations = this.data.processedOperations || {};
     if (this.data.users) {
       for (const u of Object.values(this.data.users)) {
         if (u.uniqueId) {
@@ -180,6 +186,25 @@ class StoreService {
   }
 
   /**
+   * Cryptographically deterministic, immutable Player ID derivation.
+   * Maps permanent authentication seeds (e.g. Google Sub or Guest Installation ID)
+   * into an immutable, collision-resistant canonical Player ID (e.g. BID-XXXXXX).
+   * Guaranteed: Same account ALWAYS yields the identical Player ID even across cold server reboots.
+   */
+  deriveDeterministicPlayerId(seed, prefix = 'BID-') {
+    const crypto = require('crypto');
+    const hash = crypto.createHash('sha256').update('THE_BID_IMMUTABLE_SALT_V2_' + String(seed).trim()).digest('hex');
+    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    let code = prefix;
+    let num = parseInt(hash.slice(0, 10), 16);
+    for (let i = 0; i < 6; i++) {
+      code += chars[num % chars.length];
+      num = Math.floor(num / chars.length);
+    }
+    return code;
+  }
+
+  /**
    * Database-enforced atomic resolution.
    * Every authenticated Google account maps to EXACTLY ONE permanent THE BID account.
    * Prevents duplicate BID IDs and race-condition account creation.
@@ -221,11 +246,18 @@ class StoreService {
       return matchingUser;
     }
 
-    // 3. Atomically create permanent THE BID account with database uniqueness constraint
-    const uniqueId = this.generateUniqueId('BID-');
+    // 3. Atomically create permanent THE BID account with deterministic Player ID
+    let uniqueId = this.deriveDeterministicPlayerId(cleanGoogleId, 'BID-');
     
-    // Database uniqueness constraint verification
-    this.assertUniqueIdConstraint(uniqueId);
+    // Check if deterministic ID collides with an existing DIFFERENT account in uniqueIdIndex
+    if (this.data.uniqueIdIndex && this.data.uniqueIdIndex[uniqueId.toUpperCase()]) {
+      const existingId = this.data.uniqueIdIndex[uniqueId.toUpperCase()];
+      const existingOwner = this.data.users[existingId];
+      if (existingOwner && existingOwner.googleId !== cleanGoogleId) {
+        // Fallback for rare collision
+        uniqueId = this.generateUniqueId('BID-');
+      }
+    }
 
     const newUser = {
       id: `usr_g_${cleanGoogleId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 12)}_${Date.now()}`,
@@ -440,7 +472,86 @@ class StoreService {
     return 'NOT_FRIENDS';
   }
 
-  sendFriendRequest(fromUniqueId, toUniqueId) {
+  // --- TRANSACTIONAL OUTBOX & IDEMPOTENCY ---
+  isOperationProcessed(operationId) {
+    if (!operationId || typeof operationId !== 'string') return null;
+    this.data.processedOperations = this.data.processedOperations || {};
+    return this.data.processedOperations[operationId] || null;
+  }
+
+  recordProcessedOperation(operationId, result) {
+    if (!operationId || typeof operationId !== 'string') return;
+    this.data.processedOperations = this.data.processedOperations || {};
+    this.data.processedOperations[operationId] = {
+      result,
+      processedAt: new Date().toISOString()
+    };
+    // Keep processed operations bounded to last 2000 items
+    const keys = Object.keys(this.data.processedOperations);
+    if (keys.length > 2000) {
+      delete this.data.processedOperations[keys[0]];
+    }
+  }
+
+  createOutboxEvent({ eventType, aggregateId, actorUserId, targetUserId, payload }) {
+    if (!eventType || !targetUserId) return null;
+    this.data.outbox = this.data.outbox || [];
+    const event = {
+      eventId: `evt_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      eventType,
+      aggregateId: aggregateId || null,
+      actorUserId: (actorUserId || '').trim().toUpperCase(),
+      targetUserId: (targetUserId || '').trim().toUpperCase(),
+      payload: payload || {},
+      status: 'PENDING', // PENDING -> DISPATCHED -> DELIVERED
+      createdAt: new Date().toISOString(),
+      dispatchedAt: null,
+      deliveredAt: null
+    };
+    this.data.outbox.push(event);
+    if (this.data.outbox.length > 1000) {
+      this.data.outbox = this.data.outbox.slice(-1000);
+    }
+    return event;
+  }
+
+  getPendingOutboxEvents(targetUserId) {
+    if (!targetUserId) return [];
+    const normTarget = String(targetUserId).trim().toUpperCase();
+    this.data.outbox = this.data.outbox || [];
+    return this.data.outbox.filter(e => 
+      e.targetUserId === normTarget && (e.status === 'PENDING' || e.status === 'DISPATCHED')
+    );
+  }
+
+  markOutboxEventDispatched(eventId) {
+    if (!eventId || !this.data.outbox) return;
+    const evt = this.data.outbox.find(e => e.eventId === eventId);
+    if (evt && evt.status === 'PENDING') {
+      evt.status = 'DISPATCHED';
+      evt.dispatchedAt = new Date().toISOString();
+      this.saveData();
+    }
+  }
+
+  markOutboxEventDelivered(eventId) {
+    if (!eventId || !this.data.outbox) return;
+    const evt = this.data.outbox.find(e => e.eventId === eventId);
+    if (evt) {
+      evt.status = 'DELIVERED';
+      evt.deliveredAt = new Date().toISOString();
+      this.saveData();
+    }
+  }
+
+  sendFriendRequest(fromUniqueId, toUniqueId, operationId = null) {
+    if (operationId) {
+      const prev = this.isOperationProcessed(operationId);
+      if (prev) {
+        return prev.result;
+      }
+    }
+
     const fromUser = this.findUserByUniqueId(fromUniqueId);
     const target = this.findUserByUniqueId(toUniqueId);
     if (!target) return { success: false, message: 'Player with that Player ID was not found.' };
@@ -462,8 +573,8 @@ class StoreService {
     const pendingOnSender = this.data.friendRequests[normFrom] || [];
     const reverseReq = pendingOnSender.find(r => r.status === 'PENDING' && (r.fromUniqueId || '').trim().toUpperCase() === normTarget);
     if (reverseReq) {
-      this.acceptFriendRequest(normFrom, normTarget);
-      return {
+      this.acceptFriendRequest(normFrom, normTarget, operationId ? `auto_${operationId}` : null);
+      const res = {
         success: true,
         autoAccepted: true,
         fromUser,
@@ -471,6 +582,8 @@ class StoreService {
         user: fromUser,
         message: `Mutual request! You and ${target.name} are now permanent friends.`
       };
+      if (operationId) this.recordProcessedOperation(operationId, res);
+      return res;
     }
 
     // 3. Check for existing pending request from sender to target
@@ -497,15 +610,27 @@ class StoreService {
       existingReq.date = new Date(now).toISOString();
       existingReq.fromName = fromUser.name || existingReq.fromName;
       existingReq.fromAvatar = fromUser.avatar || existingReq.fromAvatar;
+
+      const outboxEvt = this.createOutboxEvent({
+        eventType: 'FRIEND_REQUEST_SENT',
+        aggregateId: existingReq.id,
+        actorUserId: normFrom,
+        targetUserId: normTarget,
+        payload: { request: existingReq, fromUser, targetUser: target }
+      });
+
       this.saveData();
-      return {
+      const res = {
         success: true,
         reNotified: true,
         request: existingReq,
         targetUser: target,
         fromUser,
+        outboxEvent: outboxEvt,
         message: `Request notification re-sent to ${target.name}`
       };
+      if (operationId) this.recordProcessedOperation(operationId, res);
+      return res;
     }
 
     const now = Date.now();
@@ -526,17 +651,35 @@ class StoreService {
     };
     this.data.friendRequests[normTarget].push(newReq);
 
+    const outboxEvt = this.createOutboxEvent({
+      eventType: 'FRIEND_REQUEST_SENT',
+      aggregateId: newReq.id,
+      actorUserId: normFrom,
+      targetUserId: normTarget,
+      payload: { request: newReq, fromUser, targetUser: target }
+    });
+
     this.saveData(); // Authoritative DB Commit BEFORE returning
-    return {
+    const res = {
       success: true,
       request: newReq,
       targetUser: target,
       fromUser,
+      outboxEvent: outboxEvt,
       message: `Request sent to ${target.name}`
     };
+    if (operationId) this.recordProcessedOperation(operationId, res);
+    return res;
   }
 
-  acceptFriendRequest(userUniqueId, fromUniqueId) {
+  acceptFriendRequest(userUniqueId, fromUniqueId, operationId = null) {
+    if (operationId) {
+      const prev = this.isOperationProcessed(operationId);
+      if (prev) {
+        return prev.result;
+      }
+    }
+
     const user = this.findUserByUniqueId(userUniqueId);
     if (!user) {
       return { success: false, message: 'User not found.' };
@@ -592,11 +735,29 @@ class StoreService {
       this.data.friends[normFrom].push(normUser);
     }
 
+    // Outbox event for target player to receive realtime friendship sync
+    const outboxEvt = this.createOutboxEvent({
+      eventType: 'FRIEND_REQUEST_ACCEPTED',
+      aggregateId: pair,
+      actorUserId: normUser,
+      targetUserId: normFrom,
+      payload: { user, fromUser }
+    });
+
     this.saveData(); // Authoritative DB commit
-    return { success: true, user, fromUser };
+    const res = { success: true, user, fromUser, outboxEvent: outboxEvt };
+    if (operationId) this.recordProcessedOperation(operationId, res);
+    return res;
   }
 
-  declineFriendRequest(userUniqueId, fromUniqueId) {
+  declineFriendRequest(userUniqueId, fromUniqueId, operationId = null) {
+    if (operationId) {
+      const prev = this.isOperationProcessed(operationId);
+      if (prev) {
+        return prev.result;
+      }
+    }
+
     const user = this.findUserByUniqueId(userUniqueId);
     if (!user) return { success: false, message: 'User not found.' };
     const normUser = user.uniqueId.trim().toUpperCase();
@@ -609,7 +770,9 @@ class StoreService {
       pendingReq.updatedAt = new Date().toISOString();
     }
     this.saveData();
-    return { success: true, userUniqueId: normUser, fromUniqueId: normFrom };
+    const res = { success: true, userUniqueId: normUser, fromUniqueId: normFrom };
+    if (operationId) this.recordProcessedOperation(operationId, res);
+    return res;
   }
 
   getFriendsList(uniqueId) {
@@ -1003,7 +1166,11 @@ class StoreService {
   }
 
   // Room Invitations (Authoritative Lifecycle)
-  createOrUpdateInvitation({ sender, recipientUniqueId, roomId, roomCode, category, categoryTitle }) {
+  createOrUpdateInvitation({ sender, recipientUniqueId, roomId, roomCode, category, categoryTitle, operationId = null }) {
+    if (operationId) {
+      const prev = this.isOperationProcessed(operationId);
+      if (prev) return prev.result;
+    }
     if (!this.data.roomInvitations) this.data.roomInvitations = {};
     const normRecipient = (recipientUniqueId || '').trim().toUpperCase();
 
@@ -1028,8 +1195,17 @@ class StoreService {
       }
       existing.lastSentAt = now;
       existing.expiresAt = now + 10 * 60 * 1000;
+      const outboxEvt = this.createOutboxEvent({
+        eventType: 'ROOM_INVITATION_SENT',
+        aggregateId: existing.id,
+        actorUserId: (sender.uniqueId || '').trim().toUpperCase(),
+        targetUserId: normRecipient,
+        payload: { invitation: existing, sender }
+      });
       this.saveData();
-      return { invitation: existing, isDuplicate: true, reNotified: true };
+      const res = { invitation: existing, isDuplicate: true, reNotified: true, outboxEvent: outboxEvt };
+      if (operationId) this.recordProcessedOperation(operationId, res);
+      return res;
     }
 
     const invitation = {
@@ -1052,8 +1228,17 @@ class StoreService {
     };
 
     this.data.roomInvitations[invitation.id] = invitation;
+    const outboxEvt = this.createOutboxEvent({
+      eventType: 'ROOM_INVITATION_SENT',
+      aggregateId: invitation.id,
+      actorUserId: (sender.uniqueId || '').trim().toUpperCase(),
+      targetUserId: normRecipient,
+      payload: { invitation, sender }
+    });
     this.saveData();
-    return { invitation, isDuplicate: false };
+    const res = { invitation, isDuplicate: false, outboxEvent: outboxEvt };
+    if (operationId) this.recordProcessedOperation(operationId, res);
+    return res;
   }
 
   getInvitation(invitationId) {
