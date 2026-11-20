@@ -4,7 +4,9 @@
 CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(64) PRIMARY KEY,
     google_id VARCHAR(128) UNIQUE,
-    bid_id VARCHAR(32) UNIQUE NOT NULL, -- Format: TB-7K42P9
+    numeric_player_id VARCHAR(7) UNIQUE, -- Format: 7-digit numeric (e.g. 4821937)
+    bid_id VARCHAR(32) UNIQUE NOT NULL,  -- Legacy format: TB-7K42P9 / BID-XXXXXX
+    legacy_unique_id VARCHAR(32),
     display_name VARCHAR(64) NOT NULL,
     avatar_url TEXT,
     is_guest BOOLEAN DEFAULT FALSE,
@@ -14,6 +16,9 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE SEQUENCE IF NOT EXISTS numeric_player_id_seq START WITH 1000000 MAXVALUE 9999999 NO CYCLE;
+CREATE INDEX IF NOT EXISTS idx_users_numeric_player_id ON users(numeric_player_id);
 
 -- Permanent mutual friendship relationship between two user accounts
 CREATE TABLE IF NOT EXISTS friendships (
@@ -107,4 +112,19 @@ CREATE INDEX IF NOT EXISTS idx_friend_requests_recipient ON friend_requests(reci
 CREATE INDEX IF NOT EXISTS idx_friend_requests_sender ON friend_requests(sender_unique_id, status);
 CREATE INDEX IF NOT EXISTS idx_match_history_user_id ON match_history(user_id);
 CREATE INDEX IF NOT EXISTS idx_invitations_recipient ON room_invitations(recipient_unique_id, status);
+
+-- Active Private Room Keys Table
+-- Strictly 6-digit numeric codes (100000 to 999999).
+-- Concurrency-safe unique constraint ensures no two active rooms can ever share a key.
+CREATE TABLE IF NOT EXISTS active_room_keys (
+    room_code VARCHAR(6) PRIMARY KEY,
+    room_id VARCHAR(64) NOT NULL UNIQUE,
+    host_unique_id VARCHAR(32),
+    category VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_room_code_unique ON active_room_keys(room_code) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_active_room_keys_room_id ON active_room_keys(room_id);
 

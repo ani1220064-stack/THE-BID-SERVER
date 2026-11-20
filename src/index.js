@@ -3,11 +3,13 @@ const http = require('http');
 const https = require('https');
 const { Server } = require('socket.io');
 const cors = require('cors');
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const store = require('./services/store');
 const archivalService = require('./services/archivalService');
 const RoomManager = require('./rooms/RoomManager');
+const { detectFacesAndCalculateFraming } = require('./services/faceDetectionService');
 
 const app = express();
 const server = http.createServer(app);
@@ -15,11 +17,36 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || (process.env.NODE_ENV === 'production' ? 10000 : 4000);
 
 const { getLandingPageHtml } = require('./views/landingPage');
-const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Serve uploaded profile photos securely (Section 7)
+const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
+const PROFILES_UPLOAD_DIR = path.join(UPLOADS_DIR, 'profiles');
+if (!fs.existsSync(PROFILES_UPLOAD_DIR)) {
+  fs.mkdirSync(PROFILES_UPLOAD_DIR, { recursive: true });
+}
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+// Rate-limiting tracker for join_room guesses (max 10 attempts per minute per IP/socket)
+const joinAttemptsTracker = new Map();
+function isJoinRateLimited(key) {
+  const now = Date.now();
+  let timestamps = joinAttemptsTracker.get(key) || [];
+  timestamps = timestamps.filter(t => now - t < 60000);
+  return timestamps.length >= 10;
+}
+function recordFailedJoinAttempt(key) {
+  const now = Date.now();
+  let timestamps = joinAttemptsTracker.get(key) || [];
+  timestamps = timestamps.filter(t => now - t < 60000);
+  timestamps.push(now);
+  joinAttemptsTracker.set(key, timestamps);
+}
 
 // Direct Production APK Download Endpoints
 const APK_FILE_PATH = path.join(__dirname, '..', 'public', 'THE_BID_Production_v1.0.0.apk');
@@ -27,7 +54,23 @@ const handleApkDownload = (req, res) => {
   if (fs.existsSync(APK_FILE_PATH)) {
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', 'attachment; filename="THE_BID_Production_v1.0.0.apk"');
-    return res.sendFile(APK_FILE_PATH);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('CDN-Cache-Control', 'no-store');
+    res.setHeader('Surrogate-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    return res.sendFile(APK_FILE_PATH, {
+      maxAge: 0,
+      lastModified: false,
+      etag: false,
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+        'CDN-Cache-Control': 'no-store',
+        'Surrogate-Control': 'no-store',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+      }
+    });
   }
   res.status(404).json({ error: 'Production APK file not found on server' });
 };
@@ -37,6 +80,36 @@ app.get('/THE_BID_Production_v1.0.0.apk', handleApkDownload);
 app.get('/thebid.apk', handleApkDownload);
 app.get('/download/apk', handleApkDownload);
 app.get('/api/download/apk', handleApkDownload);
+app.get('/downloads/the-bid-latest.apk', handleApkDownload);
+app.get('/download/the-bid-latest.apk', handleApkDownload);
+app.get('/the-bid-latest.apk', handleApkDownload);
+
+// Download Metadata Endpoint
+app.get('/api/download/info', (req, res) => {
+  if (!fs.existsSync(APK_FILE_PATH)) {
+    return res.status(404).json({ error: 'Production APK not found' });
+  }
+  try {
+    const stats = fs.statSync(APK_FILE_PATH);
+    const fileBuffer = fs.readFileSync(APK_FILE_PATH);
+    const sha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    res.json({
+      filename: 'THE_BID_Production_v1.0.0.apk',
+      version: '1.0.0',
+      sizeBytes: stats.size,
+      sizeMb: (stats.size / (1024 * 1024)).toFixed(2) + ' MB',
+      sha256,
+      updatedAt: stats.mtime.toISOString(),
+      downloadUrls: [
+        '/downloads/the-bid-latest.apk',
+        '/thebid.apk',
+        '/download/THE_BID_Production_v1.0.0.apk'
+      ]
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to inspect APK file: ' + err.message });
+  }
+});
 
 app.get('/', (req, res) => {
   if (req.accepts('html') && !req.xhr && !req.query.json) {
@@ -241,36 +314,70 @@ const roomManager = new RoomManager(io);
 const userSockets = new Map(); // normUniqueId -> Set<socket.id>
 const socketUsers = new Map(); // socket.id -> normUniqueId
 
-function registerUserSocket(uniqueId, socketId) {
-  if (!uniqueId) return;
-  const normId = uniqueId.trim().toUpperCase();
+function registerUserSocket(identifier, socketId) {
+  if (!identifier) return;
+  const normId = identifier.trim().toUpperCase();
   if (!userSockets.has(normId)) {
     userSockets.set(normId, new Set());
   }
   userSockets.get(normId).add(socketId);
   socketUsers.set(socketId, normId);
+
+  // Cross-register all user aliases (numericPlayerId, uniqueId, id)
+  const u = store.findUserByUniqueId(normId);
+  if (u) {
+    const aliases = [u.uniqueId, u.numericPlayerId, u.id].filter(Boolean);
+    for (const a of aliases) {
+      const normA = a.trim().toUpperCase();
+      if (normA !== normId) {
+        if (!userSockets.has(normA)) userSockets.set(normA, new Set());
+        userSockets.get(normA).add(socketId);
+      }
+    }
+  }
 }
 
 function unregisterUserSocket(socketId) {
   const normId = socketUsers.get(socketId);
-  if (normId && userSockets.has(normId)) {
-    const set = userSockets.get(normId);
-    if (set instanceof Set) {
-      set.delete(socketId);
-      if (set.size === 0) {
-        userSockets.delete(normId);
+  if (normId) {
+    const u = store.findUserByUniqueId(normId);
+    const aliases = u ? [u.uniqueId, u.numericPlayerId, u.id, normId].filter(Boolean) : [normId];
+    for (const a of aliases) {
+      const normA = a.trim().toUpperCase();
+      if (userSockets.has(normA)) {
+        const set = userSockets.get(normA);
+        if (set instanceof Set) {
+          set.delete(socketId);
+          if (set.size === 0) userSockets.delete(normA);
+        } else {
+          userSockets.delete(normA);
+        }
       }
-    } else {
-      userSockets.delete(normId);
     }
   }
   socketUsers.delete(socketId);
 }
 
-function emitToUser(uniqueId, eventName, data) {
-  if (!uniqueId) return;
-  const normId = uniqueId.trim().toUpperCase();
-  const sockets = userSockets.get(normId);
+function emitToUser(identifier, eventName, data) {
+  if (!identifier) return;
+  const normId = identifier.trim().toUpperCase();
+  let sockets = userSockets.get(normId);
+
+  // If not found directly, look up aliases through store
+  if (!sockets || sockets.size === 0) {
+    const u = store.findUserByUniqueId(normId);
+    if (u) {
+      const aliases = [u.uniqueId, u.numericPlayerId, u.id].filter(Boolean);
+      for (const a of aliases) {
+        const s = userSockets.get(a.trim().toUpperCase());
+        if (s && s.size > 0) {
+          sockets = s;
+          break;
+        }
+      }
+    }
+  }
+
   if (sockets && sockets.size > 0) {
     for (const sId of sockets) {
       io.to(sId).emit(eventName, data);
@@ -330,7 +437,7 @@ const handleNativeGoogleAuth = async (req, res) => {
     // Identity claims derived strictly from verified Google token (never trusting client parameters)
     const name = verified.name || 'Google Bidder';
     const email = verified.email || null;
-    const avatar = verified.picture || 'avatar_1';
+    const avatar = verified.picture || null;
 
     // 3. Atomically resolve or create the permanent THE BID account
     const user = store.resolveOrCreateGoogleUser({
@@ -394,14 +501,25 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.post('/api/auth/guest', (req, res) => {
-  const guestNumber = Math.floor(1000 + Math.random() * 9000);
+  let guestName = req.body?.name;
+  let nameSource = req.body?.nameSource;
+
+  // Section 2.C: Stable sequential player name generation ("Player 001", "Player 002")
+  if (!guestName || guestName === 'Guest Bidder' || /^Guest Bidder\s*#?\d*$/i.test(guestName) || guestName === 'Bidder') {
+    guestName = store.generateNextPlayerName();
+    nameSource = 'GENERATED_NAME';
+  }
+
   const guestData = {
-    id: req.body?.id || `guest_${Date.now()}_${guestNumber}`,
-    name: req.body?.name || `Guest Bidder #${guestNumber}`,
+    id: req.body?.id || `guest_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}`,
+    name: guestName,
+    nameSource: nameSource || 'GENERATED_NAME',
     avatar: req.body?.avatar || 'avatar_1',
+    avatarSource: req.body?.avatarSource || 'DEFAULT_AVATAR',
     uniqueId: req.body?.uniqueId || store.generateUniqueId('BID-G'),
     trophies: req.body?.trophies || 0,
-    isGuest: true
+    isGuest: true,
+    isProfileSetupDone: !!req.body?.isProfileSetupDone
   };
   const guestUser = store.getOrCreateUser(guestData);
   res.json({ success: true, user: guestUser });
@@ -463,7 +581,7 @@ app.get('/api/archive/history', (req, res) => {
 });
 
 app.post('/api/profile/update', (req, res) => {
-  const { uniqueId, name, avatar, trophies, categoryTrophies } = req.body;
+  const { uniqueId, name, nameSource, avatar, avatarSource, customPhotoUrl, isProfileSetupDone, trophies, categoryTrophies } = req.body;
   if (!uniqueId || typeof uniqueId !== 'string') {
     return res.status(400).json({ error: 'Valid uniqueId is required' });
   }
@@ -475,11 +593,36 @@ app.post('/api/profile/update', (req, res) => {
     const cleanName = name.replace(/<[^>]*>/g, '').trim().slice(0, 30);
     if (cleanName.length > 0) {
       user.name = cleanName;
+      if (nameSource) user.nameSource = nameSource;
     }
   }
-  if (avatar && typeof avatar === 'string' && (/^avatar_[1-9]$/.test(avatar) || /^avatar_(male|female)_[1-6]$/.test(avatar))) {
-    user.avatar = avatar;
+
+  if (avatar && typeof avatar === 'string') {
+    // Validate: avatar_X (1-27), avatar_male_X (1-14), avatar_female_X (1-13), http(s) URLs, /uploads/... paths, or data:image URIs
+    const isSuppliedAvatar = /^avatar_([1-9]|[12][0-7])$/.test(avatar) ||
+      /^avatar_male_([1-9]|1[0-4])$/.test(avatar) ||
+      /^avatar_female_([1-9]|1[0-3])$/.test(avatar);
+    const isUrl = /^https?:\/\/.+/.test(avatar);
+    const isUpload = /^\/uploads\/profiles\/.+/.test(avatar);
+    const isDataUri = /^data:image\/(jpeg|png|webp);base64,.+/.test(avatar);
+
+    if (isSuppliedAvatar || isUrl || isUpload || isDataUri) {
+      user.avatar = avatar;
+      if (avatarSource) user.avatarSource = avatarSource;
+      if (customPhotoUrl) user.customPhotoUrl = customPhotoUrl;
+    }
   }
+
+  if (avatarSource) {
+    user.avatarSource = avatarSource;
+  }
+  if (nameSource) {
+    user.nameSource = nameSource;
+  }
+  if (isProfileSetupDone !== undefined) {
+    user.isProfileSetupDone = !!isProfileSetupDone;
+  }
+
   if (typeof trophies === 'number' && !isNaN(trophies) && trophies >= 0) {
     user.trophies = Math.min(100000, Math.floor(trophies));
   }
@@ -488,6 +631,99 @@ app.post('/api/profile/update', (req, res) => {
   }
   store.saveData();
   res.json({ success: true, user });
+});
+
+// Fast Face Detection & Auto-Framing Endpoint (Section 1)
+app.post('/api/profile/detect-face', async (req, res) => {
+  try {
+    const { imageBase64 } = req.body;
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return res.status(400).json({ error: 'imageBase64 payload is required' });
+    }
+
+    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+    const buffer = Buffer.from(cleanBase64, 'base64');
+
+    const result = await detectFacesAndCalculateFraming(buffer);
+    return res.json({
+      success: true,
+      ...result,
+    });
+  } catch (err) {
+    console.error('[DETECT_FACE_API_ERROR]', err);
+    return res.json({
+      success: false,
+      detected: false,
+      focusPoint: { x: 0.5, y: 0.5 },
+      suggestedScale: 1.0,
+      error: err.message,
+    });
+  }
+});
+
+// Secure Photo Upload Endpoint (Section 7)
+app.post('/api/profile/upload-photo', (req, res) => {
+  try {
+    const { uniqueId, imageBase64 } = req.body;
+    if (!uniqueId || typeof uniqueId !== 'string') {
+      return res.status(400).json({ error: 'Valid uniqueId is required' });
+    }
+    const user = store.findUserByUniqueId(uniqueId);
+    if (!user) {
+      return res.status(404).json({ error: 'Player account not found' });
+    }
+
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return res.status(400).json({ error: 'imageBase64 payload is required' });
+    }
+
+    // Size limit check (approx 4MB base64 -> ~3MB raw)
+    if (imageBase64.length > 4 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Image exceeds maximum upload limit of 3MB' });
+    }
+
+    // Clean base64 header
+    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+    const buffer = Buffer.from(cleanBase64, 'base64');
+
+    // Security: Validate magic bytes to verify real image format
+    let ext = null;
+    if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+      ext = 'jpg';
+    } else if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+      ext = 'png';
+    } else if (buffer.length >= 12 && buffer.toString('utf8', 0, 4) === 'RIFF' && buffer.toString('utf8', 8, 12) === 'WEBP') {
+      ext = 'webp';
+    }
+
+    if (!ext) {
+      return res.status(400).json({ error: 'Invalid or unsupported image format. Only JPEG, PNG, and WebP are accepted.' });
+    }
+
+    // Secure filename generation
+    const sanitizedId = uniqueId.replace(/[^a-zA-Z0-9_-]/g, '');
+    const filename = `profile_${sanitizedId}_${Date.now()}.${ext}`;
+    const filePath = path.join(PROFILES_UPLOAD_DIR, filename);
+
+    fs.writeFileSync(filePath, buffer);
+
+    const relativePath = `/uploads/profiles/${filename}`;
+    user.avatar = relativePath;
+    user.avatarSource = 'CUSTOM_UPLOAD';
+    user.customPhotoUrl = relativePath;
+    store.saveData();
+
+    console.log(`[PROFILE_UPLOAD] Saved new profile picture for ${uniqueId}: ${relativePath}`);
+
+    return res.json({
+      success: true,
+      avatarUrl: relativePath,
+      user
+    });
+  } catch (err) {
+    console.error('[PROFILE_UPLOAD_ERROR]', err);
+    return res.status(500).json({ error: 'Failed to process and store profile photo', message: err.message });
+  }
 });
 
 app.post('/api/match/record', (req, res) => {
@@ -515,18 +751,38 @@ app.post('/api/match/record', (req, res) => {
 
 // Social: Friends & Groups Endpoints (Screens 05 & 06)
 app.post('/api/friends/search', (req, res) => {
-  const { uniqueId, searcherUniqueId } = req.body;
-  if (!uniqueId) return res.status(400).json({ error: 'Unique ID is required' });
-  const target = store.findUserByUniqueId(uniqueId);
-  if (!target) return res.status(404).json({ error: 'Player not found with that Unique ID' });
+  const { uniqueId, searcherUniqueId, numericPlayerId, query } = req.body || {};
+  const searchTerm = (numericPlayerId || query || uniqueId || '').trim();
+  if (!searchTerm) return res.status(400).json({ error: 'Player ID is required' });
+
+  // Gate: Guest players cannot access multiplayer social discovery (unless in staging test mode)
+  const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
+  if (searcherUniqueId) {
+    const searcher = store.findUserByUniqueId(searcherUniqueId);
+    if (searcher && searcher.isGuest && !isStagingMode) {
+      return res.status(403).json({
+        error: 'GOOGLE_SIGN_IN_REQUIRED',
+        message: 'Sign in with Google to search players and connect with friends.'
+      });
+    }
+  }
+
+  const target = store.findUserByUniqueId(searchTerm);
+  if (!target) return res.status(404).json({ error: 'Player not found with that Player ID' });
+
+  // Guest accounts cannot be added as friends (unless in staging test mode)
+  if (target.isGuest && !isStagingMode) {
+    return res.status(404).json({ error: 'Player not found or is in guest mode' });
+  }
 
   const targetUniqueId = target.uniqueId || target.id;
-  const relationship = searcherUniqueId 
+  const relationship = searcherUniqueId
     ? store.getPlayerRelationship(searcherUniqueId, targetUniqueId)
     : 'NOT_FRIENDS';
 
   res.json({
     uniqueId: targetUniqueId,
+    numericPlayerId: target.numericPlayerId || null,
     name: target.name,
     avatar: target.avatar,
     trophies: target.trophies || 0,
@@ -540,7 +796,38 @@ app.post('/api/friends/request', (req, res) => {
   if (!fromUniqueId || !toUniqueId || typeof fromUniqueId !== 'string' || typeof toUniqueId !== 'string') {
     return res.status(400).json({ error: 'fromUniqueId and toUniqueId are required strings' });
   }
+
+  // Gate: Guest users cannot send friend requests (unless in staging test mode)
+  const senderUser = store.findUserByUniqueId(fromUniqueId);
+  if (senderUser && senderUser.isGuest && !isStagingMode) {
+    return res.status(403).json({
+      error: 'GOOGLE_SIGN_IN_REQUIRED',
+      message: 'Sign in with Google to send friend requests.'
+    });
+  }
+
   const result = store.sendFriendRequest(fromUniqueId, toUniqueId, operationId);
+
+  // Staging Test Simulation: Test players auto-accept after 800ms so developer can test on phone
+  if (isStagingMode && result.success && result.request) {
+    const targetUser = store.findUserByUniqueId(toUniqueId);
+    if (targetUser && targetUser.isStagingTestAccount) {
+      setTimeout(() => {
+        const acceptRes = store.acceptFriendRequest(toUniqueId, fromUniqueId);
+        if (acceptRes.success) {
+          emitToUser(fromUniqueId, 'friend_request_accepted', {
+            fromUniqueId: toUniqueId,
+            toUniqueId: fromUniqueId,
+            friend: targetUser
+          });
+          emitToUser(fromUniqueId, 'friendship_created', {
+            friend: targetUser
+          });
+          broadcastPresenceChange(toUniqueId);
+        }
+      }, 800);
+    }
+  }
 
   if (result.success && !result.autoAccepted && result.request) {
     console.log('[FRIEND_REQUEST_CREATED]', JSON.stringify({
@@ -660,15 +947,313 @@ app.get('/api/friends/:uniqueId', (req, res) => {
   if (!reqId || typeof reqId !== 'string' || reqId.includes('..') || ['__proto__', 'constructor', 'prototype'].includes(reqId.toLowerCase())) {
     return res.status(400).json({ error: 'Invalid Player ID format' });
   }
+  const user = store.findUserByUniqueId(reqId);
   const rawFriends = store.getFriendsList(reqId);
   const friends = rawFriends.map(f => {
     const norm = (f.uniqueId || '').trim().toUpperCase();
     const hasSockets = userSockets.has(norm) && userSockets.get(norm).size > 0;
-    const status = roomManager.getUserPresence(norm, hasSockets);
+    // In staging test mode, test accounts show as AVAILABLE online
+    const isTestAccount = f.isStagingTestAccount || (f.numericPlayerId && f.numericPlayerId.startsWith('10001'));
+    const status = isTestAccount ? 'AVAILABLE' : roomManager.getUserPresence(norm, hasSockets);
     return { ...f, status, isOnline: status !== 'OFFLINE' };
   });
   const requests = store.getFriendRequests(reqId);
-  res.json({ friends, requests });
+  res.json({ friends, requests, numericPlayerId: user?.numericPlayerId || null });
+});
+
+// STAGING TEST SUITE REST ENDPOINTS (Active ONLY when STAGING_MULTIPLAYER_TEST === 'true')
+app.get('/api/staging/test-accounts', (req, res) => {
+  if (process.env.STAGING_MULTIPLAYER_TEST !== 'true') {
+    return res.status(403).json({ error: 'Staging mode not active' });
+  }
+  const accounts = [
+    { numericPlayerId: '1000101', uniqueId: 'BID-1000101', name: 'Kabir Mehta', avatar: 'avatar_male_1', trophies: 15, gender: 'male' },
+    { numericPlayerId: '1000102', uniqueId: 'BID-1000102', name: 'Ananya Sharma', avatar: 'avatar_female_1', trophies: 12, gender: 'female' },
+    { numericPlayerId: '1000103', uniqueId: 'BID-1000103', name: 'Rohan Varma', avatar: 'avatar_male_2', trophies: 18, gender: 'male' },
+    { numericPlayerId: '1000104', uniqueId: 'BID-1000104', name: 'Priya Joshi', avatar: 'avatar_female_2', trophies: 14, gender: 'female' },
+    { numericPlayerId: '1000105', uniqueId: 'BID-1000105', name: 'Vikram Malhotra', avatar: 'avatar_male_3', trophies: 21, gender: 'male' },
+    { numericPlayerId: '1000106', uniqueId: 'BID-1000106', name: 'Meera Kapoor', avatar: 'avatar_female_3', trophies: 16, gender: 'female' },
+    { numericPlayerId: '1000107', uniqueId: 'BID-1000107', name: 'Arjun Sen', avatar: 'avatar_male_4', trophies: 19, gender: 'male' },
+    { numericPlayerId: '1000108', uniqueId: 'BID-1000108', name: 'Tara Vane', avatar: 'avatar_female_4', trophies: 11, gender: 'female' },
+    { numericPlayerId: '1000109', uniqueId: 'BID-1000109', name: 'Dev Rao', avatar: 'avatar_male_5', trophies: 23, gender: 'male' },
+    { numericPlayerId: '1000110', uniqueId: 'BID-1000110', name: 'Riya Singhania', avatar: 'avatar_female_5', trophies: 17, gender: 'female' }
+  ];
+  res.json({ accounts });
+});
+
+let activeSequentialRequestsTimer = null;
+
+function helperFindActiveHumanTarget(preferredId) {
+  if (preferredId) {
+    const found = store.findUserByUniqueId(preferredId);
+    if (found) return found;
+  }
+  const botIds = new Set(['1000101', '1000102', '1000103', '1000104', '1000105', '1000106', '1000107', '1000108', '1000109', '1000110']);
+  for (const [sId, uId] of socketUsers.entries()) {
+    const u = store.findUserByUniqueId(uId);
+    if (u && !botIds.has(String(u.numericPlayerId))) {
+      return u;
+    }
+  }
+  return store.findUserByUniqueId('guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc') || store.findUserByUniqueId('1000999');
+}
+
+function startSequentialFriendRequests(target, intervalMs = 5000) {
+  if (activeSequentialRequestsTimer) {
+    clearTimeout(activeSequentialRequestsTimer);
+    activeSequentialRequestsTimer = null;
+  }
+
+  const testAccounts = [
+    { numericPlayerId: '1000101', name: 'Kabir Mehta', avatar: 'avatar_male_1', trophies: 15 },
+    { numericPlayerId: '1000102', name: 'Ananya Sharma', avatar: 'avatar_female_1', trophies: 12 },
+    { numericPlayerId: '1000103', name: 'Rohan Varma', avatar: 'avatar_male_2', trophies: 18 },
+    { numericPlayerId: '1000104', name: 'Priya Joshi', avatar: 'avatar_female_2', trophies: 14 },
+    { numericPlayerId: '1000105', name: 'Vikram Malhotra', avatar: 'avatar_male_3', trophies: 21 },
+    { numericPlayerId: '1000106', name: 'Meera Kapoor', avatar: 'avatar_female_3', trophies: 16 },
+    { numericPlayerId: '1000107', name: 'Arjun Sen', avatar: 'avatar_male_4', trophies: 19 },
+    { numericPlayerId: '1000108', name: 'Tara Vane', avatar: 'avatar_female_4', trophies: 11 },
+    { numericPlayerId: '1000109', name: 'Dev Rao', avatar: 'avatar_male_5', trophies: 23 },
+    { numericPlayerId: '1000110', name: 'Riya Singhania', avatar: 'avatar_female_5', trophies: 17 }
+  ];
+
+  const targetKey = target.uniqueId || target.id;
+  store.data.friendRequests[targetKey] = [];
+  if (store.data.outbox) {
+    const norm = targetKey.trim().toUpperCase();
+    store.data.outbox = store.data.outbox.filter(e => e.targetUserId !== norm);
+  }
+  store.saveData();
+
+  let currentIndex = 0;
+
+  function dispatchNext() {
+    if (currentIndex >= testAccounts.length) {
+      console.log(`[SEQUENTIAL_REQUESTS] All ${testAccounts.length} requests dispatched sequentially at ${intervalMs}ms intervals.`);
+      return;
+    }
+
+    const p = testAccounts[currentIndex];
+    const senderUniqueId = `BID-${p.numericPlayerId}`;
+
+    store.removeFriendship(targetKey, senderUniqueId);
+
+    const sendRes = store.sendFriendRequest(senderUniqueId, targetKey);
+    if (sendRes.success && sendRes.request) {
+      const payload = {
+        id: sendRes.request.id,
+        requestId: sendRes.request.id,
+        fromUniqueId: senderUniqueId,
+        numericPlayerId: p.numericPlayerId,
+        fromName: p.name,
+        fromAvatar: p.avatar,
+        trophies: p.trophies,
+        timestamp: Date.now()
+      };
+
+      emitToUser(targetKey, 'friend_request_created', payload);
+      emitToUser(targetKey, 'friend_request_received', payload);
+      console.log(`[SEQUENTIAL_REQUEST #${currentIndex + 1}/10] Sent from ${p.name} (${p.numericPlayerId}) to ${targetKey} [Next in ${intervalMs / 1000}s]`);
+    }
+
+    currentIndex++;
+    if (currentIndex < testAccounts.length) {
+      activeSequentialRequestsTimer = setTimeout(dispatchNext, intervalMs);
+    }
+  }
+
+  dispatchNext();
+}
+
+app.post('/api/staging/trigger-sequential-requests', (req, res) => {
+  if (process.env.STAGING_MULTIPLAYER_TEST !== 'true') {
+    return res.status(403).json({ error: 'Staging mode not active' });
+  }
+
+  const { targetUniqueId, intervalMs = 5000 } = req.body || {};
+  const target = helperFindActiveHumanTarget(targetUniqueId);
+  if (!target) return res.status(404).json({ error: 'Target user not found' });
+
+  startSequentialFriendRequests(target, intervalMs);
+
+  res.json({
+    success: true,
+    message: `Sequential friend requests started: 10 requests every ${intervalMs / 1000} seconds`,
+    target: { id: target.id, uniqueId: target.uniqueId, numericPlayerId: target.numericPlayerId, name: target.name },
+    intervalMs
+  });
+});
+
+app.post('/api/staging/dispatch-requests', (req, res) => {
+  if (process.env.STAGING_MULTIPLAYER_TEST !== 'true') {
+    return res.status(403).json({ error: 'Staging mode not active' });
+  }
+  const { targetUniqueId, intervalMs = 5000 } = req.body || {};
+  const target = helperFindActiveHumanTarget(targetUniqueId);
+  if (!target) return res.status(404).json({ error: 'Target user not found' });
+
+  startSequentialFriendRequests(target, intervalMs);
+
+  res.json({
+    success: true,
+    message: `Sequential friend requests started: 10 requests every ${intervalMs / 1000} seconds`,
+    target: { id: target.id, uniqueId: target.uniqueId, numericPlayerId: target.numericPlayerId, name: target.name },
+    intervalMs
+  });
+});
+
+app.get('/api/staging/active-target', (req, res) => {
+  const target = helperFindActiveHumanTarget();
+  if (!target) {
+    return res.json({ found: false });
+  }
+  const normId = (target.uniqueId || target.id).trim().toUpperCase();
+  const hasSockets = userSockets.has(normId) && userSockets.get(normId).size > 0;
+  const isNumericOnline = target.numericPlayerId && userSockets.has(String(target.numericPlayerId)) && userSockets.get(String(target.numericPlayerId)).size > 0;
+  const isIdOnline = target.id && userSockets.has(target.id.trim().toUpperCase()) && userSockets.get(target.id.trim().toUpperCase()).size > 0;
+  const isOnline = Boolean(hasSockets || isNumericOnline || isIdOnline);
+  const isBusy = roomManager.isUserInActiveMatch(target.id, normId) !== null;
+
+  res.json({
+    found: true,
+    targetKey: target.uniqueId || target.id,
+    id: target.id,
+    uniqueId: target.uniqueId,
+    numericPlayerId: target.numericPlayerId,
+    name: target.name,
+    isOnline,
+    isBusy
+  });
+});
+
+// Staging QA Login: Returns dedicated developer test account (1000999 / Anirudh Tester)
+app.post('/api/staging/qa-login', (req, res) => {
+  if (process.env.STAGING_MULTIPLAYER_TEST !== 'true') {
+    return res.status(403).json({ error: 'Staging mode not active' });
+  }
+  const qaUser = store.ensureQATester();
+  res.json({
+    success: true,
+    user: qaUser,
+    token: 'STAGING_QA_SESSION_1000999'
+  });
+});
+
+// Staging Trigger: Send real-time friend request from test friend to target account
+app.post('/api/staging/trigger-friend-request', (req, res) => {
+  if (process.env.STAGING_MULTIPLAYER_TEST !== 'true') {
+    return res.status(403).json({ error: 'Staging mode not active' });
+  }
+  const { fromNumericId = '1000101', targetUniqueId = 'BID-1000999' } = req.body || {};
+  const sender = store.findUserByUniqueId(fromNumericId);
+  const target = store.findUserByUniqueId(targetUniqueId);
+  if (!sender || !target) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  const senderKey = sender.uniqueId || sender.id;
+  const targetKey = target.uniqueId || target.id;
+
+  // Clear existing friendship and requests if any so it's a guaranteed fresh request
+  const pair = store.getCanonicalPair(targetKey, senderKey);
+  if (pair && store.data.friendships) {
+    delete store.data.friendships[pair];
+  }
+  if (store.data.friends) {
+    if (store.data.friends[targetKey]) {
+      store.data.friends[targetKey] = store.data.friends[targetKey].filter(f => (typeof f === 'string' ? f : (f.uniqueId || '')).toUpperCase() !== senderKey.toUpperCase());
+    }
+    if (store.data.friends[senderKey]) {
+      store.data.friends[senderKey] = store.data.friends[senderKey].filter(f => (typeof f === 'string' ? f : (f.uniqueId || '')).toUpperCase() !== targetKey.toUpperCase());
+    }
+  }
+  if (store.data.friendRequests && store.data.friendRequests[targetKey]) {
+    store.data.friendRequests[targetKey] = store.data.friendRequests[targetKey].filter(r => (r.fromUniqueId || '').toUpperCase() !== senderKey.toUpperCase());
+  }
+
+  const sendRes = store.sendFriendRequest(senderKey, targetKey);
+  if (!sendRes.success && sendRes.message !== 'Friend request already sent') {
+    return res.status(400).json({ error: sendRes.message });
+  }
+
+  const payload = {
+    id: sendRes.request ? sendRes.request.id : `req_${Date.now()}`,
+    requestId: sendRes.request ? sendRes.request.id : `req_${Date.now()}`,
+    fromUniqueId: senderKey,
+    numericPlayerId: sender.numericPlayerId,
+    fromName: sender.name,
+    fromAvatar: sender.avatar,
+    trophies: sender.trophies || 0,
+    timestamp: Date.now()
+  };
+
+  emitToUser(targetKey, 'friend_request_created', payload);
+  emitToUser(targetKey, 'friend_request_received', payload);
+  console.log(`[STAGING] Dispatched friend request from ${sender.name} (${sender.numericPlayerId}) to ${targetKey}`);
+
+  res.json({ success: true, request: payload });
+});
+
+app.post('/api/staging/simulate-invite', (req, res) => {
+  if (process.env.STAGING_MULTIPLAYER_TEST !== 'true') {
+    return res.status(403).json({ error: 'Staging mode not active' });
+  }
+  const { testNumericId = '1000101', targetUniqueId, category = 'ipl_cricket' } = req.body || {};
+  const testUser = store.findUserByUniqueId(testNumericId);
+  const targetUser = helperFindActiveHumanTarget(targetUniqueId);
+
+  if (!testUser || !targetUser) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  const testKey = testUser.uniqueId || testUser.id;
+  const targetKey = targetUser.uniqueId || targetUser.id;
+
+  // Ensure testUser and targetUser are mutual friends so room invitation is permitted
+  store.ensureFriendship(testKey, targetKey);
+
+  const room = roomManager.createRoom({
+    hostUser: {
+      id: testUser.id,
+      uniqueId: testUser.uniqueId,
+      numericPlayerId: testUser.numericPlayerId,
+      name: testUser.name,
+      avatar: testUser.avatar,
+      trophies: testUser.trophies || 0,
+      isAI: false,
+      isStagingTestAccount: true
+    },
+    category,
+    mode: 'friends'
+  });
+
+  const inviteResult = store.createOrUpdateInvitation({
+    sender: {
+      id: testUser.id,
+      uniqueId: testUser.uniqueId,
+      numericPlayerId: testUser.numericPlayerId,
+      name: testUser.name,
+      avatar: testUser.avatar,
+      trophies: testUser.trophies || 0
+    },
+    recipientUniqueId: targetKey,
+    roomId: room.id,
+    roomCode: room.roomCode,
+    category,
+    categoryTitle: room.categoryConfig?.title || 'Auction Room'
+  });
+
+  inviteResult.invitation.roomState = roomManager.serializeRoom(room);
+  emitToUser(targetKey, 'room_invitation_received', inviteResult.invitation);
+  if (targetUser.numericPlayerId) {
+    emitToUser(targetUser.numericPlayerId, 'room_invitation_received', inviteResult.invitation);
+  }
+  if (targetUser.id && targetUser.id !== targetKey) {
+    emitToUser(targetUser.id, 'room_invitation_received', inviteResult.invitation);
+  }
+  console.log(`[STAGING] Sent room invitation for room ${room.roomCode} from ${testUser.name} to ${targetKey}`);
+
+  res.json({ success: true, roomCode: room.roomCode, roomId: room.id, invitation: inviteResult.invitation });
 });
 
 app.post('/api/groups/create', (req, res) => {
@@ -694,6 +1279,15 @@ app.get('/api/invitations/:uniqueId', (req, res) => {
   }
   const invitations = store.getPendingInvitations(reqId);
   res.json({ invitations });
+});
+
+// Authoritative Room State REST Endpoint (Immediate Pre-flight Synchronization)
+app.get('/api/rooms/:roomIdOrCode', (req, res) => {
+  const room = roomManager.resolveRoom(req.params.roomIdOrCode);
+  if (!room) {
+    return res.status(404).json({ success: false, message: 'Room not found' });
+  }
+  return res.json({ success: true, room: roomManager.serializeRoom(room) });
 });
 
 // Custom Entities REST Endpoints
@@ -769,6 +1363,27 @@ app.post('/api/testing/reload-store', (req, res) => {
   res.json({ success: true, usersCount: Object.keys(store.data.users).length });
 });
 
+app.post('/api/testing/reset-all', (req, res) => {
+  if (roomManager) {
+    if (roomManager.rooms) roomManager.rooms.clear();
+    if (roomManager.userActivities) roomManager.userActivities.clear();
+    if (roomManager.userLifecycle) roomManager.userLifecycle.clear();
+    if (roomManager.matchmakingQueues) {
+      for (const q of roomManager.matchmakingQueues.values()) q.clear();
+    }
+  }
+  store.data.friendRequests = {};
+  store.data.friends = {};
+  store.data.friendships = {};
+  store.data.roomInvitations = {};
+  store.data.activeRoomKeys = {};
+  store.data.outbox = [];
+  store.data.processedOperations = {};
+  store.saveData();
+  store.reload();
+  res.json({ success: true, message: 'All testing states, outbox, rooms, and queues reset cleanly' });
+});
+
 app.get('/api/testing/active-sockets', (req, res) => {
   const registered = Array.from(userSockets.entries()).map(([uniqueId, set]) => ({ uniqueId, sockets: Array.from(set) }));
   res.json({
@@ -786,12 +1401,34 @@ io.on('connection', (socket) => {
     if (!user || (!user.uniqueId && !user.id)) return;
     const normId = (user.uniqueId || user.id).trim().toUpperCase();
 
+    // CRITICAL LIFECYCLE RULE 1: Guest users must not receive online multiplayer social notifications
+    // Guest or unauthenticated sockets are never registered as authenticated friend recipients.
+    const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
+    const hasNumericId = Boolean(user.numericPlayerId);
+    const isTester = Boolean(user.isStagingTestAccount || hasNumericId || isStagingMode);
+
+    if (user.isGuest === true && !isTester) {
+      console.log(`[Socket] Guest connection ${socket.id} acknowledged — social notifications withheld.`);
+      return;
+    }
+
+    if (isTester && user.isGuest) {
+      user.isGuest = false;
+      user.isStagingTestAccount = true;
+    }
+
     // Ensure user record exists and is indexed in store so search & friends work immediately
     store.getOrCreateUser(user);
 
     registerUserSocket(normId, socket.id);
+    if (user.numericPlayerId) {
+      registerUserSocket(String(user.numericPlayerId), socket.id);
+    }
+    if (user.id && user.id !== normId) {
+      registerUserSocket(user.id, socket.id);
+    }
     broadcastPresenceChange(normId);
-    console.log(`[Socket] Registered user ${normId} to socket ${socket.id}`);
+    console.log(`[Socket] Registered authenticated user ${normId} (${user.numericPlayerId || ''}) to socket ${socket.id}`);
 
     // Send current presence of all permanent friends to this client
     const friends = store.getFriendsList(normId);
@@ -807,8 +1444,8 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Check for any pending room invitations upon connecting/registering
-    const pendingInvites = store.getPendingInvitations(normId);
+    // Check for any pending room invitations upon connecting/registering (unexpired only)
+    const pendingInvites = store.getPendingInvitations(normId).filter(inv => !inv.expiresAt || inv.expiresAt > Date.now());
     if (pendingInvites.length > 0) {
       socket.emit('room_invitations_batch', pendingInvites);
     }
@@ -819,36 +1456,18 @@ io.on('connection', (socket) => {
       socket.emit('friend_requests_batch', pendingRequests);
     }
 
-    // Flush and reconcile pending transactional outbox events for this user
+    // Reconcile and clear pending transactional outbox events for this user upon reconnect
+    // (Pending friend requests are already safely delivered via friend_requests_batch to avoid populating intrusive popups on startup)
     const pendingOutbox = store.getPendingOutboxEvents(normId);
     for (const evt of pendingOutbox) {
-      if (evt.eventType === 'FRIEND_REQUEST_SENT') {
-        const payload = {
-          id: evt.payload.request?.id || evt.aggregateId,
-          requestId: evt.payload.request?.id || evt.aggregateId,
-          fromUniqueId: evt.payload.request?.fromUniqueId || evt.actorUserId,
-          fromName: evt.payload.request?.fromName || evt.payload.fromUser?.name || evt.actorUserId,
-          fromAvatar: evt.payload.request?.fromAvatar || evt.payload.fromUser?.avatar || 'avatar_1',
-          trophies: evt.payload.fromUser ? (evt.payload.fromUser.trophies || 0) : 0,
-          timestamp: new Date(evt.createdAt).getTime(),
-          outboxEventId: evt.eventId
-        };
-        socket.emit('friend_request_created', payload);
-        socket.emit('friend_request_received', payload);
-      } else if (evt.eventType === 'FRIEND_REQUEST_ACCEPTED') {
-        const payload = {
-          friendUniqueId: evt.actorUserId,
-          friendName: evt.payload.fromUser?.name || evt.actorUserId,
-          relationship: 'FRIENDS',
-          outboxEventId: evt.eventId
-        };
-        socket.emit('friendship_created', payload);
-        socket.emit('friend_request_accepted', payload);
-      } else if (evt.eventType === 'ROOM_INVITATION_SENT') {
-        socket.emit('room_invitation_received', {
-          ...evt.payload.invitation,
-          outboxEventId: evt.eventId
-        });
+      if (evt.eventType === 'ROOM_INVITATION_SENT') {
+        const inv = evt.payload.invitation;
+        if (inv && (!inv.expiresAt || inv.expiresAt > Date.now())) {
+          socket.emit('room_invitation_received', {
+            ...inv,
+            outboxEventId: evt.eventId
+          });
+        }
       }
       store.markOutboxEventDispatched(evt.eventId);
     }
@@ -857,13 +1476,39 @@ io.on('connection', (socket) => {
     const activeRoom = roomManager.findActiveRoomForUser(user.id, normId);
     if (activeRoom) {
       socket.join(activeRoom.id);
-      const p = activeRoom.participants.get(user.id) || 
+      const p = activeRoom.participants.get(user.id) ||
         Array.from(activeRoom.participants.values()).find(x => x.uniqueId && x.uniqueId.toUpperCase() === normId);
       if (p) {
         p.socketId = socket.id;
       }
       roomManager.broadcastRoomState(activeRoom);
       console.log(`[Socket] Re-synchronized active room ${activeRoom.id} for user ${normId}`);
+    }
+  });
+
+  socket.on('set_player_activity', ({ activity, user }) => {
+    const u = user || socketUsers.get(socket.id);
+    const normId = (u?.uniqueId || u?.id || u || '').trim().toUpperCase();
+    if (normId) {
+      roomManager.setUserActivity(normId, activity);
+      broadcastPresenceChange(normId);
+    }
+  });
+
+  socket.on('player_at_home', ({ user }) => {
+    const u = user || socketUsers.get(socket.id);
+    const normId = (u?.uniqueId || u?.id || u || '').trim().toUpperCase();
+    if (normId) {
+      roomManager.setUserActivity(normId, 'AT_HOME');
+      broadcastPresenceChange(normId);
+    }
+  });
+
+  socket.on('unregister_user', ({ user }) => {
+    const normId = (user?.uniqueId || user?.id || socketUsers.get(socket.id) || '').trim().toUpperCase();
+    unregisterUserSocket(socket.id);
+    if (normId) {
+      broadcastPresenceChange(normId);
     }
   });
 
@@ -996,6 +1641,8 @@ io.on('connection', (socket) => {
         emitToUser(fromUniqueId, 'friend_request_accepted', payload1);
         emitToUser(userUniqueId, 'friendship_created', payload2);
         emitToUser(userUniqueId, 'friend_request_accepted', payload2);
+      } else {
+        console.log('[FRIEND_REQUEST_ACCEPT_FAILED]', result.message);
       }
     } else {
       const result = store.declineFriendRequest(userUniqueId, fromUniqueId, operationId);
@@ -1009,6 +1656,8 @@ io.on('connection', (socket) => {
         emitToUser(fromUniqueId, 'friend_request_declined', {
           friendUniqueId: userUniqueId
         });
+      } else {
+        console.log('[FRIEND_REQUEST_DECLINE_FAILED]', result.message);
       }
     }
   });
@@ -1117,7 +1766,7 @@ io.on('connection', (socket) => {
   // Direct Room Invitation System (Authoritative)
   socket.on('send_room_invite', ({ roomId, friendUniqueId, user, operationId }) => {
     if (!roomId || !friendUniqueId || !user) return;
-    const room = roomManager.getRoom(roomId);
+    const room = roomManager.resolveRoom(roomId);
     if (!room) {
       socket.emit('error_message', { message: 'Room not found or expired.' });
       return;
@@ -1135,8 +1784,13 @@ io.on('connection', (socket) => {
 
     // Verification 1: Verify sender and recipient are permanent friends
     if (!store.areFriends(senderUniqueId, normFriend)) {
-      socket.emit('error_message', { message: 'Player must be on your friend list to receive a direct invitation.' });
-      return;
+      if (process.env.STAGING_MULTIPLAYER_TEST === 'true') {
+        console.log(`[Staging] Auto-establishing friendship between ${senderUniqueId} and ${normFriend} for direct invitation.`);
+        store.ensureFriendship(senderUniqueId, normFriend);
+      } else {
+        socket.emit('error_message', { message: 'Player must be on your friend list to receive a direct invitation.' });
+        return;
+      }
     }
 
     // Verification 2: Verify room is joinable
@@ -1154,7 +1808,8 @@ io.on('connection', (socket) => {
 
     // Verification 4: Verify recipient is not BUSY inside another room
     const friendActiveRoom = roomManager.isUserInActiveMatch(null, normFriend);
-    if (friendActiveRoom && friendActiveRoom.id !== room.id && friendActiveRoom.state !== 'RESULTS') {
+    if (friendActiveRoom && friendActiveRoom.id !== room.id) {
+      console.log(`[send_room_invite BUSY BLOCK] normFriend=${normFriend}, friendActiveRoom=${friendActiveRoom.id}, room.id=${room.id}, participants=`, Array.from(friendActiveRoom.participants.values()).map(p => ({ id: p.id, uniqueId: p.uniqueId, isAI: p.isAI })));
       socket.emit('error_message', { message: 'Friend is currently busy in another match.' });
       return;
     }
@@ -1187,13 +1842,53 @@ io.on('connection', (socket) => {
       reNotified: !!inviteResult.reNotified
     });
 
-    // Deliver real-time notification to all active sockets of the friend
+    // Attach authoritative room state to invitation so receiver immediately has live team reservations
+    inviteResult.invitation.roomState = roomManager.serializeRoom(room);
+
+    // Deliver real-time notification to all active sockets of the friend (across all aliases: uniqueId, numericPlayerId, id)
     emitToUser(normFriend, 'room_invitation_received', inviteResult.invitation);
+    const friendUserObj = store.findUserByUniqueId(normFriend);
+    if (friendUserObj) {
+      if (friendUserObj.numericPlayerId) {
+        emitToUser(friendUserObj.numericPlayerId, 'room_invitation_received', inviteResult.invitation);
+      }
+      if (friendUserObj.id && friendUserObj.id.toUpperCase() !== normFriend) {
+        emitToUser(friendUserObj.id, 'room_invitation_received', inviteResult.invitation);
+      }
+    }
     console.log('[ROOM_INVITE_DELIVERED_SOCKET]', JSON.stringify({
       invitationId: inviteResult.invitation.id,
       recipientUniqueId: normFriend,
       timestamp: Date.now()
     }));
+
+    // In Staging Test Mode: if invited friend is a test account, auto-accept and enter room after 1.2s
+    if (process.env.STAGING_MULTIPLAYER_TEST === 'true') {
+      const friendUser = store.findUserByUniqueId(normFriend);
+      if (friendUser && friendUser.isStagingTestAccount) {
+        setTimeout(() => {
+          store.updateInvitationStatus(inviteResult.invitation.id, 'ACCEPTED');
+          const joinRes = roomManager.joinRoom(room.id, {
+            id: friendUser.id,
+            uniqueId: friendUser.uniqueId,
+            numericPlayerId: friendUser.numericPlayerId,
+            name: friendUser.name,
+            avatar: friendUser.avatar,
+            trophies: friendUser.trophies || 0,
+            isGuest: false,
+            isStagingTestAccount: true
+          });
+          if (joinRes.success) {
+            io.to(room.id).emit('room_updated', { room: roomManager.serializeRoom(room) });
+            emitToUser(user.uniqueId || user.id, 'room_invite_accepted', {
+              friendName: friendUser.name,
+              friendUniqueId: friendUser.uniqueId,
+              roomCode: room.roomCode
+            });
+          }
+        }, 1200);
+      }
+    }
   });
 
   socket.on('respond_room_invite', ({ invitationId, response, user }) => {
@@ -1227,7 +1922,14 @@ io.on('connection', (socket) => {
     if (response === 'ACCEPTED') {
       // Atomic Verification:
       // 1. Verify recipient identity matches invitation recipient
-      if (invitation.recipientUniqueId.toUpperCase() !== userUniqueId) {
+      const normRecipient = (invitation.recipientUniqueId || '').trim().toUpperCase();
+      const userMatches = (
+        userUniqueId === normRecipient ||
+        (user.numericPlayerId && (normRecipient === user.numericPlayerId || normRecipient === `BID-${user.numericPlayerId}`)) ||
+        (user.uniqueId && normRecipient === user.uniqueId.trim().toUpperCase()) ||
+        (user.id && normRecipient === user.id.trim().toUpperCase())
+      );
+      if (!userMatches) {
         socket.emit('error_message', { message: 'This invitation was not addressed to you.' });
         return;
       }
@@ -1279,7 +1981,8 @@ io.on('connection', (socket) => {
       socket.emit('room_joined', {
         roomId: room.id,
         roomCode: room.roomCode,
-        category: room.category
+        category: room.category,
+        room: roomManager.serializeRoom(joinResult.room || room)
       });
       roomManager.broadcastRoomState(joinResult.room);
       broadcastPresenceChange(userUniqueId);
@@ -1417,7 +2120,12 @@ io.on('connection', (socket) => {
   // Leave / Exit Room Flow
   socket.on('leave_room', ({ roomId, userId, uniqueId }) => {
     const normId = (uniqueId || socketUsers.get(socket.id) || '').trim().toUpperCase();
+    const room = roomManager.resolveRoom(roomId);
     roomManager.leaveRoom(roomId, userId, normId);
+    if (room) {
+      socket.leave(room.id);
+      if (room.roomCode) socket.leave(room.roomCode);
+    }
     socket.leave(roomId);
     if (normId) {
       broadcastPresenceChange(normId);

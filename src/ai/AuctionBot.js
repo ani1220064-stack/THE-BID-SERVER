@@ -267,6 +267,11 @@ const FICTIONAL_BOT_MANAGERS = [
   'Aditya Roy',
   'Reyansh Kapoor',
   'Kunal Singhania',
+  'Vihaan Singhania',
+  'Dhruv Patel',
+  'Samar Verma',
+  'Ishaan Khurana',
+  'Vivaan Oberoi',
 ];
 
 const BOT_STRATEGIES = ['balanced', 'aggressive', 'value_hunter'];
@@ -278,6 +283,14 @@ const MALE_BOT_AVATARS = [
   'avatar_male_4',
   'avatar_male_5',
   'avatar_male_6',
+  'avatar_male_7',
+  'avatar_male_8',
+  'avatar_male_9',
+  'avatar_male_10',
+  'avatar_male_11',
+  'avatar_male_12',
+  'avatar_male_13',
+  'avatar_male_14',
 ];
 
 const FEMALE_BOT_AVATARS = [
@@ -285,6 +298,15 @@ const FEMALE_BOT_AVATARS = [
   'avatar_female_2',
   'avatar_female_3',
   'avatar_female_4',
+  'avatar_female_5',
+  'avatar_female_6',
+  'avatar_female_7',
+  'avatar_female_8',
+  'avatar_female_9',
+  'avatar_female_10',
+  'avatar_female_11',
+  'avatar_female_12',
+  'avatar_female_13',
 ];
 
 const FEMALE_FIRST_NAMES = new Set([

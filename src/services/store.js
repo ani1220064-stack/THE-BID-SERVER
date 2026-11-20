@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 
 const DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'store.json');
@@ -13,6 +14,9 @@ const defaultState = {
   users: {},        // id -> { id, name, avatar, uniqueId, trophies: 0, createdAt }
   googleUsers: {},  // verifiedGoogleId -> uniqueId
   uniqueIdIndex: {}, // uniqueId -> id (Database-level UNIQUE constraint index)
+  numericPlayerIndex: {}, // 7-digit numeric player ID -> id
+  nextNumericPlayerId: 1000001,
+  allocatedLoyaltyIds: [], // ['1111111', '2222222', ...]
   friends: {},      // uniqueId -> [friendUniqueIds]
   friendships: {},  // canonicalPair (min::max) -> { id, userA, userB, createdAt }
   friendRequests: {}, // recipientUniqueId -> [{ fromUniqueId, fromName, date }]
@@ -20,10 +24,31 @@ const defaultState = {
   matchHistory: {}, // uniqueId -> [{ matchId, date, mode, budget, squad: [], rank, aiScore, summary }]
   trophyLedger: {}, // uniqueId -> [{ trophyId, matchId, trophyType, category, earnedAt }]
   roomInvitations: {}, // invitationId -> { id, sender, recipientUniqueId, roomId, roomCode, category, status, createdAt, expiresAt }
+  activeRoomKeys: {},  // roomCode (6-digit numeric) -> { code, roomId, hostUniqueId, category, createdAt, isActive }
   customEntities: {}, // ownerUniqueId -> [{ id, ownerUniqueId, categoryId, name, entityType, createdAt, deletedAt }]
   outbox: [],       // [{ eventId, eventType, aggregateId, actorId, targetId, payload, status, createdAt }]
   processedOperations: {} // operationId -> { result, timestamp }
 };
+
+// Section 4: Special Player IDs & Early Loyalty Tier
+const FOUNDER_EMAIL = 'ani1220064@gmail.com';
+const FOUNDER_PLAYER_ID = '0000000';
+const LOYALTY_PLAYER_IDS = [
+  '1111111',
+  '2222222',
+  '3333333',
+  '4444444',
+  '5555555',
+  '6666666',
+  '7777777',
+  '8888888',
+  '9999999',
+  '1000000'
+];
+const RESERVED_SPECIAL_IDS = new Set([
+  FOUNDER_PLAYER_ID,
+  ...LOYALTY_PLAYER_IDS
+]);
 
 class StoreService {
   constructor() {
@@ -40,8 +65,12 @@ class StoreService {
         return {
           ...defaultState,
           ...parsed,
+          activeRoomKeys: parsed.activeRoomKeys || {},
           googleUsers: parsed.googleUsers || {},
           uniqueIdIndex: parsed.uniqueIdIndex || {},
+          numericPlayerIndex: parsed.numericPlayerIndex || {},
+          nextNumericPlayerId: parsed.nextNumericPlayerId || 1000001,
+          allocatedLoyaltyIds: Array.isArray(parsed.allocatedLoyaltyIds) ? parsed.allocatedLoyaltyIds : [],
           outbox: Array.isArray(parsed.outbox) ? parsed.outbox : [],
           processedOperations: parsed.processedOperations || {}
         };
@@ -49,7 +78,7 @@ class StoreService {
     } catch (e) {
       console.error('Error loading store.json, initializing default:', e.message);
     }
-    return { ...defaultState, googleUsers: {}, uniqueIdIndex: {}, outbox: [], processedOperations: {} };
+    return { ...defaultState, googleUsers: {}, uniqueIdIndex: {}, numericPlayerIndex: {}, nextNumericPlayerId: 1000001, allocatedLoyaltyIds: [], outbox: [], processedOperations: {} };
   }
 
   reload() {
@@ -60,12 +89,22 @@ class StoreService {
 
   rebuildIndices() {
     this.data.uniqueIdIndex = this.data.uniqueIdIndex || {};
+    this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+    this.data.nextNumericPlayerId = this.data.nextNumericPlayerId || 1000001;
+    this.data.allocatedLoyaltyIds = Array.isArray(this.data.allocatedLoyaltyIds) ? this.data.allocatedLoyaltyIds : [];
     this.data.googleUsers = this.data.googleUsers || {};
     this.data.trophyLedger = this.data.trophyLedger || {};
+    this.data.activeRoomKeys = this.data.activeRoomKeys || {};
     this.data.outbox = Array.isArray(this.data.outbox) ? this.data.outbox : [];
     this.data.processedOperations = this.data.processedOperations || {};
     if (this.data.users) {
       for (const u of Object.values(this.data.users)) {
+        if (u.numericPlayerId) {
+          this.data.numericPlayerIndex[String(u.numericPlayerId).trim()] = u.id;
+        }
+        if (u.legacyNumericPlayerId) {
+          this.data.numericPlayerIndex[String(u.legacyNumericPlayerId).trim()] = u.id;
+        }
         if (u.uniqueId) {
           this.data.uniqueIdIndex[u.uniqueId.toUpperCase()] = u.id;
         }
@@ -186,6 +225,72 @@ class StoreService {
   }
 
   /**
+   * Generates a 7-digit numeric-only Player ID.
+   * Format: exactly 7 digits (1000001 - 9999999).
+   * Guaranteed collision-free via atomic check against numericPlayerIndex and RESERVED_SPECIAL_IDS.
+   */
+  generateNumericPlayerId() {
+    this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+    let nextId = this.data.nextNumericPlayerId || 1000001;
+    while (
+      RESERVED_SPECIAL_IDS.has(String(nextId)) ||
+      this.data.numericPlayerIndex[String(nextId)] ||
+      this.findUserByNumericId(String(nextId))
+    ) {
+      nextId++;
+    }
+    this.data.nextNumericPlayerId = nextId + 1;
+    this.saveData();
+    return String(nextId);
+  }
+
+  /**
+   * O(1) lookup of user by 7-digit numeric Player ID.
+   */
+  findUserByNumericId(numericId) {
+    if (!numericId) return null;
+    const clean = String(numericId).trim();
+    if (!/^\d{7}$/.test(clean)) return null;
+    this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+    const userId = this.data.numericPlayerIndex[clean];
+    if (userId && this.data.users && this.data.users[userId]) {
+      return this.data.users[userId];
+    }
+    // Fallback scan across users in case index missed
+    if (this.data.users) {
+      const match = Object.values(this.data.users).find(u => u.numericPlayerId && String(u.numericPlayerId).trim() === clean);
+      if (match) {
+        this.data.numericPlayerIndex[clean] = match.id;
+        return match;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Generates a collision-safe, sequential player name for guests/new accounts (Section 2.C).
+   * Format: Player 001, Player 002, etc.
+   */
+  generateNextPlayerName() {
+    if (!this.data.nextPlayerNumber) {
+      let maxNum = 0;
+      if (this.data.users) {
+        for (const u of Object.values(this.data.users)) {
+          if (u.name && /^Player\s+(\d+)$/i.test(u.name)) {
+            const m = parseInt(u.name.match(/^Player\s+(\d+)$/i)[1], 10);
+            if (!isNaN(m) && m > maxNum) maxNum = m;
+          }
+        }
+      }
+      this.data.nextPlayerNumber = maxNum + 1;
+    }
+    const name = `Player ${String(this.data.nextPlayerNumber).padStart(3, '0')}`;
+    this.data.nextPlayerNumber++;
+    this.saveData();
+    return name;
+  }
+
+  /**
    * Cryptographically deterministic, immutable Player ID derivation.
    * Maps permanent authentication seeds (e.g. Google Sub or Guest Installation ID)
    * into an immutable, collision-resistant canonical Player ID (e.g. BID-XXXXXX).
@@ -207,13 +312,18 @@ class StoreService {
   /**
    * Database-enforced atomic resolution.
    * Every authenticated Google account maps to EXACTLY ONE permanent THE BID account.
-   * Prevents duplicate BID IDs and race-condition account creation.
+   * Special Rule (Section 4):
+   * - Founder ID '0000000' is strictly assigned to verified Google account ani1220064@gmail.com
+   * - First ten loyalty Google accounts atomically receive priority IDs: 1111111, 2222222, 3333333, 4444444, 5555555, 6666666, 7777777, 8888888, 9999999, 1000000
+   * - All subsequent Google accounts receive standard unique 7-digit IDs (1000001+)
    */
   resolveOrCreateGoogleUser({ verifiedGoogleId, name, email, avatar }) {
     if (!verifiedGoogleId || typeof verifiedGoogleId !== 'string') {
       throw new Error('Valid verified Google identity is required');
     }
     const cleanGoogleId = verifiedGoogleId.trim();
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+    const isFounder = cleanEmail === FOUNDER_EMAIL.toLowerCase();
 
     // 1. O(1) Lookup in stable googleUsers identity index
     this.data.googleUsers = this.data.googleUsers || {};
@@ -222,14 +332,65 @@ class StoreService {
       const existingUser = this.findUserByUniqueId(existingUniqueId);
       if (existingUser) {
         let modified = false;
-        if (name && existingUser.name !== name && name !== 'Bidder') {
-          existingUser.name = name;
+
+        // If this is the founder, enforce FOUNDER ID '0000000'
+        if (isFounder && existingUser.numericPlayerId !== FOUNDER_PLAYER_ID) {
+          if (existingUser.numericPlayerId) {
+            existingUser.legacyNumericPlayerId = existingUser.numericPlayerId;
+            this.data.numericPlayerIndex[existingUser.legacyNumericPlayerId] = existingUser.id;
+          }
+          existingUser.numericPlayerId = FOUNDER_PLAYER_ID;
+          this.data.numericPlayerIndex[FOUNDER_PLAYER_ID] = existingUser.id;
+          existingUser.isFounder = true;
+          existingUser.role = 'FOUNDER';
+          existingUser.email = FOUNDER_EMAIL;
           modified = true;
         }
-        if (avatar && existingUser.avatar !== avatar) {
-          existingUser.avatar = avatar;
+
+        // Always record Google profile claims for optional selection (Section 4.B & 10)
+        if (name && existingUser.googleDisplayName !== name) {
+          existingUser.googleDisplayName = name;
           modified = true;
         }
+        if (avatar && existingUser.googlePhotoUrl !== avatar) {
+          existingUser.googlePhotoUrl = avatar;
+          modified = true;
+        }
+
+        // Section 2.B & 10: Never silently overwrite a custom display name
+        if (name && existingUser.nameSource !== 'CUSTOM_NAME') {
+          if (existingUser.name !== name && name !== 'Bidder') {
+            existingUser.name = name;
+            existingUser.nameSource = 'GOOGLE_NAME';
+            modified = true;
+          }
+        }
+
+        // Section 3: Automatic Google profile picture synchronization rules
+        if (avatar) {
+          if (existingUser.avatarSource !== 'THE_BID_AVATAR' && existingUser.avatarSource !== 'CUSTOM_UPLOAD') {
+            if (existingUser.avatar !== avatar) {
+              existingUser.avatar = avatar;
+              existingUser.avatarSource = 'GOOGLE_PROFILE';
+              modified = true;
+            }
+          }
+        } else {
+          if (existingUser.avatarSource === 'GOOGLE_PROFILE') {
+            existingUser.avatar = 'avatar_male_1';
+            existingUser.avatarSource = 'DEFAULT_AVATAR';
+            existingUser.googlePhotoUrl = null;
+            modified = true;
+          }
+        }
+
+        if (!existingUser.numericPlayerId && !existingUser.isGuest) {
+          existingUser.numericPlayerId = isFounder ? FOUNDER_PLAYER_ID : this.generateNumericPlayerId();
+          this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+          this.data.numericPlayerIndex[existingUser.numericPlayerId] = existingUser.id;
+          modified = true;
+        }
+
         if (modified) {
           this.saveData();
         }
@@ -237,16 +398,56 @@ class StoreService {
       }
     }
 
-    // 2. Secondary check across existing user records to recover any orphaned mappings
-    const matchingUser = Object.values(this.data.users).find(u => u.googleId === cleanGoogleId);
+    // 2. Safe Migration for Founder account (e.g. Anirudh's existing primary account)
+    if (isFounder) {
+      const existingFounderAccount = Object.values(this.data.users || {}).find(u => 
+        (u.email && u.email.toLowerCase() === FOUNDER_EMAIL.toLowerCase()) ||
+        (u.uniqueId === 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc') ||
+        (u.id === 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc')
+      );
+
+      if (existingFounderAccount) {
+        console.log(`[AUTH] Atomically linking existing founder account [${existingFounderAccount.uniqueId}] to verified Google ID & FOUNDER ID 0000000...`);
+        if (existingFounderAccount.numericPlayerId && existingFounderAccount.numericPlayerId !== FOUNDER_PLAYER_ID) {
+          existingFounderAccount.legacyNumericPlayerId = existingFounderAccount.numericPlayerId;
+          this.data.numericPlayerIndex[existingFounderAccount.legacyNumericPlayerId] = existingFounderAccount.id;
+        }
+        existingFounderAccount.numericPlayerId = FOUNDER_PLAYER_ID;
+        existingFounderAccount.googleId = cleanGoogleId;
+        existingFounderAccount.email = FOUNDER_EMAIL;
+        existingFounderAccount.isFounder = true;
+        existingFounderAccount.role = 'FOUNDER';
+        existingFounderAccount.isGuest = false;
+        if (name && existingFounderAccount.nameSource !== 'CUSTOM_NAME') {
+          existingFounderAccount.name = name;
+        }
+        if (avatar && existingFounderAccount.avatarSource !== 'CUSTOM_UPLOAD') {
+          existingFounderAccount.googlePhotoUrl = avatar;
+        }
+        this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+        this.data.numericPlayerIndex[FOUNDER_PLAYER_ID] = existingFounderAccount.id;
+        this.data.googleUsers[cleanGoogleId] = existingFounderAccount.uniqueId;
+        this.saveData();
+        return existingFounderAccount;
+      }
+    }
+
+    // 3. Secondary check across existing user records to recover any orphaned mappings
+    const matchingUser = Object.values(this.data.users || {}).find(u => u.googleId === cleanGoogleId);
     if (matchingUser) {
       this.data.googleUsers[cleanGoogleId] = matchingUser.uniqueId;
       this.data.uniqueIdIndex[matchingUser.uniqueId.toUpperCase()] = matchingUser.id;
+      if (isFounder && matchingUser.numericPlayerId !== FOUNDER_PLAYER_ID) {
+        matchingUser.numericPlayerId = FOUNDER_PLAYER_ID;
+        this.data.numericPlayerIndex[FOUNDER_PLAYER_ID] = matchingUser.id;
+        matchingUser.isFounder = true;
+        matchingUser.role = 'FOUNDER';
+      }
       this.saveData();
       return matchingUser;
     }
 
-    // 3. Atomically create permanent THE BID account with deterministic Player ID
+    // 4. Atomically create permanent THE BID account with deterministic Player ID
     let uniqueId = this.deriveDeterministicPlayerId(cleanGoogleId, 'BID-');
     
     // Check if deterministic ID collides with an existing DIFFERENT account in uniqueIdIndex
@@ -254,8 +455,33 @@ class StoreService {
       const existingId = this.data.uniqueIdIndex[uniqueId.toUpperCase()];
       const existingOwner = this.data.users[existingId];
       if (existingOwner && existingOwner.googleId !== cleanGoogleId) {
-        // Fallback for rare collision
         uniqueId = this.generateUniqueId('BID-');
+      }
+    }
+
+    // 5. Allocate Numeric Player ID (Founder -> Loyalty -> Sequential)
+    let numericPlayerId = null;
+    let isLoyalty = false;
+    let loyaltyPriority = null;
+
+    if (isFounder) {
+      numericPlayerId = FOUNDER_PLAYER_ID;
+    } else {
+      this.data.allocatedLoyaltyIds = Array.isArray(this.data.allocatedLoyaltyIds) ? this.data.allocatedLoyaltyIds : [];
+      const nextLoyaltyId = LOYALTY_PLAYER_IDS.find(id => 
+        !this.data.allocatedLoyaltyIds.includes(id) && 
+        !this.data.numericPlayerIndex[id] &&
+        !this.findUserByNumericId(id)
+      );
+
+      if (nextLoyaltyId) {
+        numericPlayerId = nextLoyaltyId;
+        this.data.allocatedLoyaltyIds.push(nextLoyaltyId);
+        isLoyalty = true;
+        loyaltyPriority = this.data.allocatedLoyaltyIds.length;
+        console.log(`[AUTH] Assigned Loyalty Player ID [${numericPlayerId}] (Priority #${loyaltyPriority}) to new Google user: ${cleanEmail || cleanGoogleId}`);
+      } else {
+        numericPlayerId = this.generateNumericPlayerId();
       }
     }
 
@@ -263,9 +489,17 @@ class StoreService {
       id: `usr_g_${cleanGoogleId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 12)}_${Date.now()}`,
       googleId: cleanGoogleId,
       uniqueId,
+      numericPlayerId,
+      legacyUniqueId: uniqueId,
       name: name || 'Bidder',
-      email: email || null,
+      nameSource: name ? 'GOOGLE_NAME' : 'GENERATED_NAME',
+      email: cleanEmail || null,
       avatar: avatar || 'avatar_1',
+      avatarSource: avatar ? 'GOOGLE_PROFILE' : 'DEFAULT_AVATAR',
+      googleDisplayName: name || null,
+      googlePhotoUrl: avatar || null,
+      customPhotoUrl: null,
+      isProfileSetupDone: false,
       trophies: 0,
       categoryTrophies: {
         ipl_cricket: 0,
@@ -277,12 +511,18 @@ class StoreService {
         luxury_collection: 0
       },
       isGuest: false,
+      isFounder: isFounder,
+      role: isFounder ? 'FOUNDER' : 'PLAYER',
+      isLoyaltyPlayer: isLoyalty,
+      loyaltyPriority: loyaltyPriority,
       createdAt: new Date().toISOString()
     };
 
     this.data.users[newUser.id] = newUser;
     this.data.googleUsers[cleanGoogleId] = uniqueId;
     this.data.uniqueIdIndex[uniqueId.toUpperCase()] = newUser.id;
+    this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+    this.data.numericPlayerIndex[numericPlayerId] = newUser.id;
     this.data.friends[uniqueId] = this.data.friends[uniqueId] || [];
     this.data.friendRequests[uniqueId] = this.data.friendRequests[uniqueId] || [];
     this.data.matchHistory[uniqueId] = this.data.matchHistory[uniqueId] || [];
@@ -326,8 +566,31 @@ class StoreService {
     );
 
     if (existing) {
-      if (userData.name) existing.name = userData.name;
-      if (userData.avatar) existing.avatar = userData.avatar;
+      if (userData.name && existing.nameSource !== 'CUSTOM_NAME') {
+        existing.name = userData.name;
+        if (userData.nameSource) existing.nameSource = userData.nameSource;
+      }
+      if (userData.avatar && existing.avatarSource !== 'CUSTOM_UPLOAD' && existing.avatarSource !== 'THE_BID_AVATAR') {
+        existing.avatar = userData.avatar;
+        if (userData.avatarSource) existing.avatarSource = userData.avatarSource;
+      }
+      if (userData.isProfileSetupDone !== undefined) {
+        existing.isProfileSetupDone = userData.isProfileSetupDone;
+      }
+      const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
+      if (userData.isStagingTestAccount || (isStagingMode && existing.numericPlayerId)) {
+        existing.isStagingTestAccount = true;
+        existing.isGuest = false;
+      }
+      if (!existing.numericPlayerId && (!existing.isGuest || isStagingMode)) {
+        existing.numericPlayerId = this.generateNumericPlayerId();
+        this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+        this.data.numericPlayerIndex[existing.numericPlayerId] = existing.id;
+      }
+      if (existing.numericPlayerId) {
+        this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+        this.data.numericPlayerIndex[existing.numericPlayerId] = existing.id;
+      }
       if (existing.uniqueId) {
         this.data.uniqueIdIndex[existing.uniqueId.toUpperCase()] = existing.id;
       }
@@ -335,13 +598,37 @@ class StoreService {
       return existing;
     }
 
-    const uniqueId = userData.uniqueId || this.generateUniqueId(userData.isGuest ? 'BID-G' : 'BID-');
+    const isGuest = !!userData.isGuest;
+    const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
+    let numericPlayerId = userData.numericPlayerId;
+    if (numericPlayerId && RESERVED_SPECIAL_IDS.has(String(numericPlayerId))) {
+      if (!this.data.numericPlayerIndex || this.data.numericPlayerIndex[String(numericPlayerId)] !== userData.id) {
+        numericPlayerId = null;
+      }
+    }
+    if (!numericPlayerId && (!isGuest || isStagingMode)) {
+      numericPlayerId = this.generateNumericPlayerId();
+    }
+    const uniqueId = userData.uniqueId || this.generateUniqueId(isGuest ? 'BID-G' : 'BID-');
+    const finalName = userData.name || this.generateNextPlayerName();
+    const finalNameSource = userData.nameSource || (userData.name ? 'CUSTOM_NAME' : 'GENERATED_NAME');
+    const finalAvatar = userData.avatar || 'avatar_1';
+    const finalAvatarSource = userData.avatarSource || 'DEFAULT_AVATAR';
+
     const newUser = {
       id: userData.id || `user_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-      name: userData.name || 'Bidder',
+      name: finalName,
+      nameSource: finalNameSource,
       email: userData.email || null,
-      avatar: userData.avatar || 'avatar_1',
+      avatar: finalAvatar,
+      avatarSource: finalAvatarSource,
+      googleDisplayName: userData.googleDisplayName || null,
+      googlePhotoUrl: userData.googlePhotoUrl || null,
+      customPhotoUrl: userData.customPhotoUrl || null,
+      isProfileSetupDone: !!userData.isProfileSetupDone,
       uniqueId,
+      numericPlayerId,
+      legacyUniqueId: uniqueId,
       trophies: userData.trophies || 0,
       categoryTrophies: userData.categoryTrophies || {
         ipl_cricket: userData.trophies || 0,
@@ -352,12 +639,16 @@ class StoreService {
         luxury_cars: 0,
         luxury_collection: 0
       },
-      isGuest: !!userData.isGuest,
+      isGuest,
       isMockTestAccount: !!userData.isMockTestAccount,
       createdAt: new Date().toISOString()
     };
 
     this.data.users[newUser.id] = newUser;
+    if (numericPlayerId) {
+      this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+      this.data.numericPlayerIndex[numericPlayerId] = newUser.id;
+    }
     if (uniqueId) {
       this.data.uniqueIdIndex[uniqueId.toUpperCase()] = newUser.id;
       this.data.friends[uniqueId] = this.data.friends[uniqueId] || [];
@@ -368,11 +659,174 @@ class StoreService {
     return newUser;
   }
 
+  ensureQATester() {
+    this.data.users = this.data.users || {};
+    this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
+    this.data.uniqueIdIndex = this.data.uniqueIdIndex || {};
+    this.data.friends = this.data.friends || {};
+    this.data.friendRequests = this.data.friendRequests || {};
+
+    const userId = 'usr_staging_qa_1000999';
+    const numericPlayerId = '1000999';
+    const uniqueId = 'BID-1000999';
+
+    // Also upgrade current physical device tester profile in staging
+    const devUserId = 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc';
+    if (this.data.users[devUserId]) {
+      const du = this.data.users[devUserId];
+      du.isStagingTestAccount = true;
+      du.isGuest = false;
+      du.authType = 'GOOGLE';
+      if (!du.numericPlayerId) du.numericPlayerId = '1000129';
+      du.bidId = `BID-${du.numericPlayerId}`;
+      this.data.numericPlayerIndex[du.numericPlayerId] = devUserId;
+      this.data.uniqueIdIndex[devUserId] = devUserId;
+      this.data.uniqueIdIndex[du.numericPlayerId] = devUserId;
+      this.data.uniqueIdIndex[`BID-${du.numericPlayerId}`] = devUserId;
+
+      // Ensure mutual friendships with test players so direct room invitations succeed
+      for (let i = 1; i <= 10; i++) {
+        const testBotId = `BID-1000${100 + i}`;
+        this.ensureFriendship(devUserId, testBotId);
+      }
+    }
+
+    if (this.data.users[userId]) {
+      const u = this.data.users[userId];
+      u.isStagingTestAccount = true;
+      u.isGuest = false;
+      u.numericPlayerId = numericPlayerId;
+      u.uniqueId = uniqueId;
+      u.legacyUniqueId = uniqueId;
+      u.authType = 'GOOGLE';
+      this.data.numericPlayerIndex[numericPlayerId] = userId;
+      this.data.uniqueIdIndex[uniqueId] = userId;
+      this.data.uniqueIdIndex[numericPlayerId] = userId;
+      return u;
+    }
+
+    const qaUser = {
+      id: userId,
+      playerId: userId,
+      numericPlayerId,
+      uniqueId,
+      legacyUniqueId: uniqueId,
+      name: 'Anirudh Tester',
+      displayName: 'Anirudh Tester',
+      email: 'anirudh.qa.tester@thebid.game',
+      avatar: 'avatar_male_1',
+      nameSource: 'CUSTOM_NAME',
+      avatarSource: 'THE_BID_AVATAR',
+      isProfileSetupDone: true,
+      trophies: 25,
+      totalTrophies: 25,
+      trophiesEarned: 25,
+      categoryTrophies: {
+        ipl_cricket: 10,
+        fifa_football: 5,
+        formula_1: 4,
+        nba: 3,
+        movie_stars: 3,
+        luxury_cars: 0,
+        luxury_collection: 0
+      },
+      isGuest: false,
+      isStagingTestAccount: true,
+      authType: 'GOOGLE',
+      createdAt: new Date().toISOString()
+    };
+
+    this.data.users[userId] = qaUser;
+    this.data.numericPlayerIndex[numericPlayerId] = userId;
+    this.data.uniqueIdIndex[uniqueId] = userId;
+    this.data.uniqueIdIndex[numericPlayerId] = userId;
+    this.data.friends[uniqueId] = this.data.friends[uniqueId] || [];
+    this.data.friendRequests[uniqueId] = this.data.friendRequests[uniqueId] || [];
+    this.saveData();
+    return qaUser;
+  }
+
+  ensureFriendship(idA, idB) {
+    if (!idA || !idB) return;
+    const userA = this.findUserByUniqueId(idA);
+    const userB = this.findUserByUniqueId(idB);
+    if (!userA || !userB) return;
+    const normA = (userA.uniqueId || userA.id).trim().toUpperCase();
+    const normB = (userB.uniqueId || userB.id).trim().toUpperCase();
+    if (normA === normB) return;
+
+    this.data.friendships = this.data.friendships || {};
+    this.data.friends = this.data.friends || {};
+
+    const pair = this.getCanonicalPair(normA, normB);
+    this.data.friendships[pair] = {
+      userA: normA,
+      userB: normB,
+      createdAt: new Date().toISOString()
+    };
+
+    this.data.friends[normA] = this.data.friends[normA] || [];
+    if (!this.data.friends[normA].some(f => (typeof f === 'string' ? f : (f.uniqueId || '')).toUpperCase() === normB)) {
+      this.data.friends[normA].push(normB);
+    }
+
+    this.data.friends[normB] = this.data.friends[normB] || [];
+    if (!this.data.friends[normB].some(f => (typeof f === 'string' ? f : (f.uniqueId || '')).toUpperCase() === normA)) {
+      this.data.friends[normB].push(normA);
+    }
+    this.saveData();
+  }
+
+  removeFriendship(idA, idB) {
+    if (!idA || !idB) return;
+    const userA = this.findUserByUniqueId(idA);
+    const userB = this.findUserByUniqueId(idB);
+    const keysA = [idA, userA?.uniqueId, userA?.id, userA?.numericPlayerId].filter(Boolean).map(x => String(x).trim().toUpperCase());
+    const keysB = [idB, userB?.uniqueId, userB?.id, userB?.numericPlayerId].filter(Boolean).map(x => String(x).trim().toUpperCase());
+
+    if (this.data.friendships) {
+      for (const a of keysA) {
+        for (const b of keysB) {
+          const pair = this.getCanonicalPair(a, b);
+          if (pair && this.data.friendships[pair]) {
+            delete this.data.friendships[pair];
+          }
+        }
+      }
+    }
+
+    if (this.data.friends) {
+      for (const a of keysA) {
+        if (this.data.friends[a]) {
+          this.data.friends[a] = this.data.friends[a].filter(f => {
+            const fKey = (typeof f === 'string' ? f : (f.uniqueId || f.id || '')).trim().toUpperCase();
+            return !keysB.includes(fKey);
+          });
+        }
+      }
+      for (const b of keysB) {
+        if (this.data.friends[b]) {
+          this.data.friends[b] = this.data.friends[b].filter(f => {
+            const fKey = (typeof f === 'string' ? f : (f.uniqueId || f.id || '')).trim().toUpperCase();
+            return !keysA.includes(fKey);
+          });
+        }
+      }
+    }
+    this.saveData();
+  }
+
   findUserByUniqueId(identifier) {
     if (!identifier) return null;
     const clean = String(identifier).trim();
     if (!clean) return null;
     const cleanUpper = clean.toUpperCase();
+
+    // 0. Direct 7-digit numeric player ID lookup (O(1))
+    if (/^\d{7}$/.test(clean)) {
+      const numMatch = this.findUserByNumericId(clean);
+      if (numMatch) return numMatch;
+    }
 
     // 1. Check googleUsers index
     if (this.data.googleUsers && this.data.googleUsers[clean]) {
@@ -428,22 +882,42 @@ class StoreService {
 
   areFriends(uniqueIdA, uniqueIdB) {
     if (!uniqueIdA || !uniqueIdB) return false;
-    const normA = uniqueIdA.trim().toUpperCase();
-    const normB = uniqueIdB.trim().toUpperCase();
+    let normA = uniqueIdA.trim().toUpperCase();
+    let normB = uniqueIdB.trim().toUpperCase();
     if (normA === normB) return false;
 
-    // Check canonical pair table
-    const pair = this.getCanonicalPair(normA, normB);
+    // Check canonical pair table with direct keys
+    let pair = this.getCanonicalPair(normA, normB);
     if (pair && this.data.friendships && this.data.friendships[pair]) {
       return true;
     }
 
-    // Check directional lists as backwards-compatible fallback
-    const friendsOfA = this.data.friends[normA] || [];
-    if (friendsOfA.some(f => (f || '').trim().toUpperCase() === normB)) return true;
+    // Resolve users to their canonical uniqueIds if available
+    const userA = this.findUserByUniqueId(normA);
+    const userB = this.findUserByUniqueId(normB);
+    if (userA && userB) {
+      const canA = (userA.uniqueId || userA.id).trim().toUpperCase();
+      const canB = (userB.uniqueId || userB.id).trim().toUpperCase();
+      if (canA !== normA || canB !== normB) {
+        pair = this.getCanonicalPair(canA, canB);
+        if (pair && this.data.friendships && this.data.friendships[pair]) {
+          return true;
+        }
+      }
+    }
 
-    const friendsOfB = this.data.friends[normB] || [];
-    if (friendsOfB.some(f => (f || '').trim().toUpperCase() === normA)) return true;
+    // Check directional lists as backwards-compatible fallback
+    const friendsOfA = this.data.friends[normA] || (userA ? this.data.friends[userA.uniqueId] : []) || [];
+    if (friendsOfA.some(f => {
+      const fId = typeof f === 'string' ? f : (f.uniqueId || f.id || '');
+      return fId.trim().toUpperCase() === normB || (userB && fId.trim().toUpperCase() === (userB.uniqueId || '').toUpperCase());
+    })) return true;
+
+    const friendsOfB = this.data.friends[normB] || (userB ? this.data.friends[userB.uniqueId] : []) || [];
+    if (friendsOfB.some(f => {
+      const fId = typeof f === 'string' ? f : (f.uniqueId || f.id || '');
+      return fId.trim().toUpperCase() === normA || (userA && fId.trim().toUpperCase() === (userA.uniqueId || '').toUpperCase());
+    })) return true;
 
     return false;
   }
@@ -520,16 +994,17 @@ class StoreService {
     const normTarget = String(targetUserId).trim().toUpperCase();
     this.data.outbox = this.data.outbox || [];
     return this.data.outbox.filter(e => 
-      e.targetUserId === normTarget && (e.status === 'PENDING' || e.status === 'DISPATCHED')
+      e.targetUserId === normTarget && e.status === 'PENDING'
     );
   }
 
   markOutboxEventDispatched(eventId) {
     if (!eventId || !this.data.outbox) return;
     const evt = this.data.outbox.find(e => e.eventId === eventId);
-    if (evt && evt.status === 'PENDING') {
-      evt.status = 'DISPATCHED';
-      evt.dispatchedAt = new Date().toISOString();
+    if (evt) {
+      evt.status = 'DELIVERED';
+      evt.dispatchedAt = evt.dispatchedAt || new Date().toISOString();
+      evt.deliveredAt = new Date().toISOString();
       this.saveData();
     }
   }
@@ -696,14 +1171,19 @@ class StoreService {
     const requests = this.data.friendRequests[normUser] || [];
     const pendingReq = requests.find(r => (r.status === 'PENDING' || r.status === 'ACCEPTED') && (r.fromUniqueId || '').trim().toUpperCase() === normFrom);
 
+    // Also mark any reverse request on fromUser as ACCEPTED if present
+    const fromRequests = this.data.friendRequests[normFrom] || [];
+    const reversePending = fromRequests.find(r => (r.status === 'PENDING' || r.status === 'ACCEPTED') && (r.fromUniqueId || '').trim().toUpperCase() === normUser);
+
+    if (!pendingReq && !reversePending) {
+      return { success: false, message: 'No pending friend request found.' };
+    }
+
     if (pendingReq) {
       pendingReq.status = 'ACCEPTED';
       pendingReq.updatedAt = new Date().toISOString();
     }
 
-    // Also mark any reverse request on fromUser as ACCEPTED if present
-    const fromRequests = this.data.friendRequests[normFrom] || [];
-    const reversePending = fromRequests.find(r => (r.status === 'PENDING' || r.status === 'ACCEPTED') && (r.fromUniqueId || '').trim().toUpperCase() === normUser);
     if (reversePending) {
       reversePending.status = 'ACCEPTED';
       reversePending.updatedAt = new Date().toISOString();
@@ -728,10 +1208,10 @@ class StoreService {
     this.data.friends[normUser] = this.data.friends[normUser] || [];
     this.data.friends[normFrom] = this.data.friends[normFrom] || [];
 
-    if (!this.data.friends[normUser].some(f => (f || '').toUpperCase() === normFrom)) {
+    if (!this.data.friends[normUser].some(f => (typeof f === 'string' ? f : (f?.uniqueId || f?.id || '')).toUpperCase() === normFrom)) {
       this.data.friends[normUser].push(normFrom);
     }
-    if (!this.data.friends[normFrom].some(f => (f || '').toUpperCase() === normUser)) {
+    if (!this.data.friends[normFrom].some(f => (typeof f === 'string' ? f : (f?.uniqueId || f?.id || '')).toUpperCase() === normUser)) {
       this.data.friends[normFrom].push(normUser);
     }
 
@@ -791,7 +1271,8 @@ class StoreService {
 
     if (this.data.friends && this.data.friends[normId]) {
       for (const fId of this.data.friends[normId]) {
-        if (fId) friendIdSet.add(fId.trim().toUpperCase());
+        const clean = (typeof fId === 'string' ? fId : (fId ? (fId.uniqueId || fId.id || '') : '')).trim().toUpperCase();
+        if (clean) friendIdSet.add(clean);
       }
     }
 
@@ -799,11 +1280,13 @@ class StoreService {
       const u = this.findUserByUniqueId(fId);
       return u ? {
         uniqueId: u.uniqueId,
+        numericPlayerId: u.numericPlayerId || null,
         name: u.name,
         avatar: u.avatar || 'avatar_1',
         trophies: u.trophies || 0
       } : {
         uniqueId: fId,
+        numericPlayerId: null,
         name: 'Bidder',
         avatar: 'avatar_1',
         trophies: 0
@@ -819,6 +1302,7 @@ class StoreService {
       const sender = this.findUserByUniqueId(r.fromUniqueId);
       return {
         ...r,
+        numericPlayerId: sender ? (sender.numericPlayerId || null) : null,
         name: r.fromName || (sender ? sender.name : r.fromUniqueId),
         avatar: r.fromAvatar || (sender ? sender.avatar : 'avatar_2'),
         trophies: sender ? (sender.trophies || 0) : 0
@@ -1039,10 +1523,10 @@ class StoreService {
         const mId = m.matchId || m.id;
         if (!mId || typeof mId !== 'string') continue;
 
-        // Security Enforcement: Offline sync ONLY allows offline / computer mode matches
-        const mode = (m.mode || '').toLowerCase();
-        if (mode !== 'computer' && mode !== 'offline') {
-          console.warn(`[SYNC_REJECTED] Attempted to sync non-offline match mode: ${m.mode}`);
+        // Security Enforcement: Offline sync ONLY allows offline / computer mode matches (rejects online multiplayer matches)
+        const mode = (m.mode || m.gameMode || '').toLowerCase();
+        if (mode && mode !== 'computer' && mode !== 'offline') {
+          console.warn(`[SYNC_REJECTED] Attempted to sync non-offline match mode: ${m.mode || m.gameMode}`);
           continue;
         }
 
@@ -1054,22 +1538,22 @@ class StoreService {
         }
 
         // Validate squad & budget
-        const budget = Number(m.budget);
+        const budget = Number(m.budget || m.startingBudget || 100);
         if (isNaN(budget) || budget < 10 || budget > 500) {
           continue;
         }
-        if (!Array.isArray(m.squad) || m.squad.length === 0) {
-          continue;
+        const squad = Array.isArray(m.squad) ? m.squad : (Array.isArray(m.purchasedItems) ? m.purchasedItems : (Array.isArray(m.finalSquad) ? m.finalSquad : []));
+
+        // Validate spending within budget if squad present
+        if (squad.length > 0) {
+          const totalSpent = squad.reduce((sum, item) => sum + (Number(item.soldPrice || item.basePrice || item.price) || 0), 0);
+          if (totalSpent > budget * 1.05) { // allow 5% rounding tolerance
+            console.warn(`[SYNC_REJECTED] Squad spending (${totalSpent}) exceeds budget (${budget})`);
+            continue;
+          }
         }
 
-        // Validate spending within budget
-        const totalSpent = m.squad.reduce((sum, item) => sum + (Number(item.soldPrice || item.basePrice || item.price) || 0), 0);
-        if (totalSpent > budget * 1.05) { // allow 5% rounding tolerance
-          console.warn(`[SYNC_REJECTED] Squad spending (${totalSpent}) exceeds budget (${budget})`);
-          continue;
-        }
-
-        const isWinner = !!m.isWinner && Number(m.rank) === 1;
+        const isWinner = !!m.isWinner && (m.rank === undefined || Number(m.rank) === 1 || Number(m.finalRank) === 1);
 
         if (!this.data.matchHistory[canonicalKey].some(existing => (existing.matchId || existing.id) === mId)) {
           const sanitizedMatch = {
@@ -1079,11 +1563,16 @@ class StoreService {
             category: cat,
             categoryTitle: m.categoryTitle || cat,
             budget,
-            squad: m.squad,
+            squad,
             rank: isWinner ? 1 : (Number(m.rank) || 2),
             isWinner,
             trophyEarned: isWinner ? 1 : 0,
-            date: m.completedAt || m.date || new Date().toISOString()
+            date: m.completedAt || m.date || new Date().toISOString(),
+            completedAt: m.completedAt || m.date || new Date().toISOString(),
+            clientOccurredAt: m.clientOccurredAt || m.completedAt || m.date || new Date().toISOString(),
+            resultsSnapshot: m.resultsSnapshot,
+            purchasedItems: m.purchasedItems || squad,
+            finalSquad: m.finalSquad || squad
           };
 
           this.data.matchHistory[canonicalKey].unshift(sanitizedMatch);
@@ -1119,8 +1608,26 @@ class StoreService {
       }
     }
 
-    // 2. Direct raw data.trophies injection is rejected!
-    // (Trophies must ONLY be derived from the authoritative verified matches above)
+    // 2. Ingest offline trophies ledger
+    if (Array.isArray(data.trophies)) {
+      for (const t of data.trophies) {
+        if (!t || !t.trophyId) continue;
+        const cat = t.category || 'ipl_cricket';
+        if (!this.data.trophyLedger[canonicalKey].some(existing => existing.trophyId === t.trophyId)) {
+          this.data.trophyLedger[canonicalKey].push({
+            trophyId: t.trophyId,
+            playerId: canonicalKey,
+            matchId: t.matchId || `match_${t.trophyId}`,
+            trophyType: t.trophyType || 'CHAMPION',
+            trophyName: t.trophyName || `${t.categoryTitle || cat} Champion`,
+            earnedAt: t.earnedAt || t.createdAt || new Date().toISOString(),
+            category: cat,
+            gameMode: 'computer',
+            createdAt: new Date().toISOString()
+          });
+        }
+      }
+    }
 
     // 3. Reconcile user profile stats
     if (user) {
@@ -1214,6 +1721,7 @@ class StoreService {
         id: sender.id,
         name: sender.name,
         uniqueId: sender.uniqueId,
+        numericPlayerId: sender.numericPlayerId || (sender.uniqueId && sender.uniqueId.startsWith('BID-') ? sender.uniqueId.replace('BID-', '') : ''),
         avatar: sender.avatar || 'avatar_1'
       },
       recipientUniqueId: normRecipient,
@@ -1281,6 +1789,68 @@ class StoreService {
       }
     });
     if (modified) this.saveData();
+  }
+
+  // =========================================================================
+  // AUTHORITATIVE 6-DIGIT NUMERIC ROOM KEY PERSISTENCE
+  // Strictly numeric: 100000 to 999999
+  // =========================================================================
+  isRoomKeyActive(code) {
+    if (!code || typeof code !== 'string') return false;
+    const clean = code.replace(/\D/g, '').slice(0, 6);
+    if (clean.length !== 6) return false;
+    if (!this.data.activeRoomKeys) this.data.activeRoomKeys = {};
+    const entry = this.data.activeRoomKeys[clean];
+    return Boolean(entry && entry.isActive);
+  }
+
+  reserveRoomKey(code, roomId, hostUniqueId, category) {
+    if (!code || typeof code !== 'string') throw new Error('Invalid room key');
+    const clean = code.replace(/\D/g, '').slice(0, 6);
+    if (!/^\d{6}$/.test(clean)) throw new Error('Room key must be exactly 6 digits');
+    if (!this.data.activeRoomKeys) this.data.activeRoomKeys = {};
+
+    // Atomic uniqueness check
+    if (this.data.activeRoomKeys[clean] && this.data.activeRoomKeys[clean].isActive) {
+      return { success: false, reason: 'ALREADY_ACTIVE' };
+    }
+
+    this.data.activeRoomKeys[clean] = {
+      code: clean,
+      roomId,
+      hostUniqueId: (hostUniqueId || '').trim().toUpperCase(),
+      category: category || 'ipl_cricket',
+      createdAt: Date.now(),
+      isActive: true,
+    };
+    this.saveData();
+    return { success: true, code: clean };
+  }
+
+  releaseRoomKey(codeOrRoomId) {
+    if (!codeOrRoomId) return false;
+    if (!this.data.activeRoomKeys) return false;
+    const clean = String(codeOrRoomId).replace(/\D/g, '').slice(0, 6);
+    let released = false;
+
+    if (clean.length === 6 && this.data.activeRoomKeys[clean] && this.data.activeRoomKeys[clean].isActive) {
+      this.data.activeRoomKeys[clean].isActive = false;
+      this.data.activeRoomKeys[clean].releasedAt = Date.now();
+      released = true;
+    } else {
+      for (const entry of Object.values(this.data.activeRoomKeys)) {
+        if (entry.roomId === codeOrRoomId && entry.isActive) {
+          entry.isActive = false;
+          entry.releasedAt = Date.now();
+          released = true;
+        }
+      }
+    }
+
+    if (released) {
+      this.saveData();
+    }
+    return released;
   }
 
   // --- CUSTOM ENTITY MANAGEMENT ---
