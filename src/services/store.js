@@ -31,7 +31,15 @@ const defaultState = {
 };
 
 // Section 4: Special Player IDs & Early Loyalty Tier
-const FOUNDER_EMAIL = 'ani1220064@gmail.com';
+const FOUNDER_EMAILS = [
+  'ani1220064@gmail.com',
+  'anirudhchaturvedi122006@gmail.com'
+];
+const isFounderEmail = (em) => {
+  if (!em) return false;
+  const lower = String(em).trim().toLowerCase();
+  return FOUNDER_EMAILS.some(fe => fe.toLowerCase() === lower);
+};
 const FOUNDER_PLAYER_ID = '0000000';
 const LOYALTY_PLAYER_IDS = [
   '1111111',
@@ -59,9 +67,25 @@ class StoreService {
 
   loadData() {
     try {
+      let raw = null;
       if (fs.existsSync(DATA_FILE)) {
-        const raw = fs.readFileSync(DATA_FILE, 'utf8');
-        const parsed = JSON.parse(raw);
+        raw = fs.readFileSync(DATA_FILE, 'utf8');
+      }
+      let parsed = raw ? JSON.parse(raw) : null;
+      if (!parsed || !parsed.users || Object.keys(parsed.users).length === 0) {
+        const SEED_FILE = path.join(DATA_DIR, 'seed_store.json');
+        if (fs.existsSync(SEED_FILE)) {
+          console.log('[STORE] Seeding database from seed_store.json...');
+          const seedRaw = fs.readFileSync(SEED_FILE, 'utf8');
+          parsed = JSON.parse(seedRaw);
+          try {
+            fs.writeFileSync(DATA_FILE, seedRaw, 'utf8');
+          } catch (wErr) {
+            console.warn('[STORE] Could not write seed to DATA_FILE:', wErr.message);
+          }
+        }
+      }
+      if (parsed) {
         return {
           ...defaultState,
           ...parsed,
@@ -104,6 +128,12 @@ class StoreService {
         }
         if (u.legacyNumericPlayerId) {
           this.data.numericPlayerIndex[String(u.legacyNumericPlayerId).trim()] = u.id;
+        }
+        if (u.bidId && u.bidId.startsWith('BID-')) {
+          const numPart = u.bidId.replace('BID-', '').trim();
+          if (/^\d+$/.test(numPart)) {
+            this.data.numericPlayerIndex[numPart] = u.id;
+          }
         }
         if (u.uniqueId) {
           this.data.uniqueIdIndex[u.uniqueId.toUpperCase()] = u.id;
@@ -249,8 +279,8 @@ class StoreService {
    */
   findUserByNumericId(numericId) {
     if (!numericId) return null;
-    const clean = String(numericId).trim();
-    if (!/^\d{7}$/.test(clean)) return null;
+    const clean = String(numericId).trim().replace(/\D/g, '');
+    if (!clean) return null;
     this.data.numericPlayerIndex = this.data.numericPlayerIndex || {};
     const userId = this.data.numericPlayerIndex[clean];
     if (userId && this.data.users && this.data.users[userId]) {
@@ -258,7 +288,12 @@ class StoreService {
     }
     // Fallback scan across users in case index missed
     if (this.data.users) {
-      const match = Object.values(this.data.users).find(u => u.numericPlayerId && String(u.numericPlayerId).trim() === clean);
+      const match = Object.values(this.data.users).find(u => 
+        (u.numericPlayerId && String(u.numericPlayerId).trim() === clean) ||
+        (u.legacyNumericPlayerId && String(u.legacyNumericPlayerId).trim() === clean) ||
+        (u.bidId && u.bidId.replace(/\D/g, '') === clean) ||
+        (u.uniqueId && u.uniqueId.replace(/\D/g, '') === clean)
+      );
       if (match) {
         this.data.numericPlayerIndex[clean] = match.id;
         return match;
@@ -323,7 +358,7 @@ class StoreService {
     }
     const cleanGoogleId = verifiedGoogleId.trim();
     const cleanEmail = email ? String(email).trim().toLowerCase() : null;
-    const isFounder = cleanEmail === FOUNDER_EMAIL.toLowerCase();
+    const isFounder = isFounderEmail(cleanEmail);
 
     // 1. O(1) Lookup in stable googleUsers identity index
     this.data.googleUsers = this.data.googleUsers || {};
@@ -343,7 +378,7 @@ class StoreService {
           this.data.numericPlayerIndex[FOUNDER_PLAYER_ID] = existingUser.id;
           existingUser.isFounder = true;
           existingUser.role = 'FOUNDER';
-          existingUser.email = FOUNDER_EMAIL;
+          if (cleanEmail) existingUser.email = cleanEmail;
           modified = true;
         }
 
@@ -401,7 +436,7 @@ class StoreService {
     // 2. Safe Migration for Founder account (e.g. Anirudh's existing primary account)
     if (isFounder) {
       const existingFounderAccount = Object.values(this.data.users || {}).find(u => 
-        (u.email && u.email.toLowerCase() === FOUNDER_EMAIL.toLowerCase()) ||
+        (u.email && isFounderEmail(u.email)) ||
         (u.uniqueId === 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc') ||
         (u.id === 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc')
       );
@@ -414,7 +449,7 @@ class StoreService {
         }
         existingFounderAccount.numericPlayerId = FOUNDER_PLAYER_ID;
         existingFounderAccount.googleId = cleanGoogleId;
-        existingFounderAccount.email = FOUNDER_EMAIL;
+        if (cleanEmail) existingFounderAccount.email = cleanEmail;
         existingFounderAccount.isFounder = true;
         existingFounderAccount.role = 'FOUNDER';
         existingFounderAccount.isGuest = false;

@@ -13,4 +13,9 @@ yarn-debug.log*
 yarn-error.log*
 
 # Persistent local data
-data/store.json
+# data/store.json is tracked to seed production databases on Render
+!data/store.json
+!data/seed_store.json
+data/*.bak
+data/*.tmp
+

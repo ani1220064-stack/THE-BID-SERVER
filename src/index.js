@@ -277,6 +277,7 @@ async function verifyGoogleToken(token) {
     if (isAccessToken && info.sub && info.name === 'Google Player') {
       const uInfo = await queryUserInfo(token);
       if (uInfo) {
+        if (uInfo.sub && !info.sub) info.sub = uInfo.sub;
         if (uInfo.name) info.name = uInfo.name;
         if (uInfo.email) info.email = uInfo.email;
         if (uInfo.picture) info.picture = uInfo.picture;
@@ -289,6 +290,7 @@ async function verifyGoogleToken(token) {
       if (token.startsWith('ya29.') && info.sub && info.name === 'Google Player') {
         const uInfo = await queryUserInfo(token);
         if (uInfo) {
+          if (uInfo.sub && !info.sub) info.sub = uInfo.sub;
           if (uInfo.name) info.name = uInfo.name;
           if (uInfo.email) info.email = uInfo.email;
           if (uInfo.picture) info.picture = uInfo.picture;
@@ -751,15 +753,16 @@ app.post('/api/match/record', (req, res) => {
 
 // Social: Friends & Groups Endpoints (Screens 05 & 06)
 app.post('/api/friends/search', (req, res) => {
-  const { uniqueId, searcherUniqueId, numericPlayerId, query } = req.body || {};
-  const searchTerm = (numericPlayerId || query || uniqueId || '').trim();
-  if (!searchTerm) return res.status(400).json({ error: 'Player ID is required' });
+  const { uniqueId, searcherUniqueId, numericPlayerId, query, searchTerm, id } = req.body || {};
+  const rawTerm = (numericPlayerId || query || searchTerm || uniqueId || id || '').trim();
+  const cleanTerm = rawTerm.replace(/^[#@]/, '').trim();
+  if (!cleanTerm) return res.status(400).json({ error: 'Player ID is required' });
 
   // Gate: Guest players cannot access multiplayer social discovery (unless in staging test mode)
   const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
   if (searcherUniqueId) {
     const searcher = store.findUserByUniqueId(searcherUniqueId);
-    if (searcher && searcher.isGuest && !isStagingMode) {
+    if (searcher && searcher.isGuest && !isStagingMode && !searcher.isStagingTestAccount) {
       return res.status(403).json({
         error: 'GOOGLE_SIGN_IN_REQUIRED',
         message: 'Sign in with Google to search players and connect with friends.'
@@ -767,11 +770,14 @@ app.post('/api/friends/search', (req, res) => {
     }
   }
 
-  const target = store.findUserByUniqueId(searchTerm);
+  let target = store.findUserByUniqueId(cleanTerm);
+  if (!target && /^\d+$/.test(cleanTerm)) {
+    target = store.findUserByNumericId(cleanTerm);
+  }
   if (!target) return res.status(404).json({ error: 'Player not found with that Player ID' });
 
-  // Guest accounts cannot be added as friends (unless in staging test mode)
-  if (target.isGuest && !isStagingMode) {
+  // Guest accounts cannot be added as friends (unless in staging test mode or test accounts)
+  if (target.isGuest && !isStagingMode && !target.isStagingTestAccount) {
     return res.status(404).json({ error: 'Player not found or is in guest mode' });
   }
 
@@ -782,7 +788,7 @@ app.post('/api/friends/search', (req, res) => {
 
   res.json({
     uniqueId: targetUniqueId,
-    numericPlayerId: target.numericPlayerId || null,
+    numericPlayerId: target.numericPlayerId || target.legacyNumericPlayerId || null,
     name: target.name,
     avatar: target.avatar,
     trophies: target.trophies || 0,
@@ -797,6 +803,7 @@ app.post('/api/friends/request', (req, res) => {
     return res.status(400).json({ error: 'fromUniqueId and toUniqueId are required strings' });
   }
 
+  const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
   // Gate: Guest users cannot send friend requests (unless in staging test mode)
   const senderUser = store.findUserByUniqueId(fromUniqueId);
   if (senderUser && senderUser.isGuest && !isStagingMode) {
@@ -1407,16 +1414,6 @@ io.on('connection', (socket) => {
     const hasNumericId = Boolean(user.numericPlayerId);
     const isTester = Boolean(user.isStagingTestAccount || hasNumericId || isStagingMode);
 
-    if (user.isGuest === true && !isTester) {
-      console.log(`[Socket] Guest connection ${socket.id} acknowledged — social notifications withheld.`);
-      return;
-    }
-
-    if (isTester && user.isGuest) {
-      user.isGuest = false;
-      user.isStagingTestAccount = true;
-    }
-
     // Ensure user record exists and is indexed in store so search & friends work immediately
     store.getOrCreateUser(user);
 
@@ -1428,7 +1425,7 @@ io.on('connection', (socket) => {
       registerUserSocket(user.id, socket.id);
     }
     broadcastPresenceChange(normId);
-    console.log(`[Socket] Registered authenticated user ${normId} (${user.numericPlayerId || ''}) to socket ${socket.id}`);
+    console.log(`[Socket] Registered user ${normId} (${user.numericPlayerId || ''}) to socket ${socket.id}`);
 
     // Send current presence of all permanent friends to this client
     const friends = store.getFriendsList(normId);
@@ -1753,7 +1750,8 @@ io.on('connection', (socket) => {
     socket.emit('room_joined', {
       roomId: result.room.id,
       roomCode: result.room.roomCode,
-      category: result.room.category
+      category: result.room.category,
+      room: roomManager.serializeRoom(result.room)
     });
     roomManager.broadcastRoomState(result.room);
 
@@ -2044,6 +2042,8 @@ io.on('connection', (socket) => {
     if (!result.success) {
       socket.emit('team_select_error', { message: result.message, teamId });
       socket.emit('error_message', { message: result.message });
+    } else {
+      socket.emit('team_selected', { teamId, franchise: result.franchise });
     }
   };
 

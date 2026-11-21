@@ -86,9 +86,14 @@ class RoomManager {
     const norm = this.normalizeRoomCode(code);
     if (norm && norm.length === 6) {
       const roomId = this.roomCodes.get(norm);
-      if (roomId) return this.rooms.get(roomId) || null;
+      if (roomId) {
+        const room = this.rooms.get(roomId);
+        if (room && room.state !== 'RESULTS') return room;
+      }
     }
-    return this.rooms.get(code) || null;
+    const direct = this.rooms.get(code);
+    if (direct && direct.state !== 'RESULTS') return direct;
+    return null;
   }
 
   resolveRoom(roomIdOrCode) {
@@ -96,7 +101,7 @@ class RoomManager {
     const str = String(roomIdOrCode).trim();
     // 1. Direct lookup by ID
     const direct = this.rooms.get(str);
-    if (direct) return direct;
+    if (direct && direct.state !== 'RESULTS') return direct;
 
     // 2. Lookup by normalized 6-digit room code in roomCodes map
     const norm = this.normalizeRoomCode(str);
@@ -104,13 +109,13 @@ class RoomManager {
       const mappedId = this.roomCodes.get(norm);
       if (mappedId) {
         const found = this.rooms.get(mappedId);
-        if (found) return found;
+        if (found && found.state !== 'RESULTS') return found;
       }
     }
 
-    // 3. Fallback scan across all rooms by roomCode or id
+    // 3. Fallback scan across all active rooms by roomCode or id
     for (const r of this.rooms.values()) {
-      if (r && (r.id === str || r.roomCode === str || r.roomCode === norm)) {
+      if (r && r.state !== 'RESULTS' && (r.id === str || r.roomCode === str || r.roomCode === norm)) {
         return r;
       }
     }
@@ -465,10 +470,7 @@ class RoomManager {
         userFranchise = f;
       }
     }
-    // If not specified or already taken, assign first remaining unowned franchise
-    if (!userFranchise) {
-      userFranchise = categoryFranchises.find(f => !room.teamOwnership.has(f.id));
-    }
+    // Only claim franchise if user explicitly requested one that was available; do not auto-claim for new joiners
     if (userFranchise) {
       room.teamOwnership.set(userFranchise.id, user.id);
     }
@@ -484,7 +486,7 @@ class RoomManager {
       name: user.name,
       avatar: user.avatar || 'avatar_1',
       teamId: userFranchise ? userFranchise.id : null,
-      teamName: userFranchise ? userFranchise.name : (user.teamName || `${user.name || 'Friend'}'s XI`),
+      teamName: userFranchise ? userFranchise.name : null,
       purse: room.proposedBudget,
       startingBudget: room.proposedBudget,
       squad: [],
@@ -524,7 +526,7 @@ class RoomManager {
     for (const room of this.rooms.values()) {
       if (room && room.state !== 'RESULTS' && room.participants) {
         for (const p of room.participants.values()) {
-          if (!p.isAI) {
+          if (!p.isAI && !p.isDisconnected) {
             if (p.id === userId || (p.uniqueId && normUnique && p.uniqueId.toUpperCase() === normUnique)) {
               return room;
             }
