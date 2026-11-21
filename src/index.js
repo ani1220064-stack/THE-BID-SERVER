@@ -413,7 +413,14 @@ roomManager.onPresenceChanged = (normUniqueId) => {
 
 // REST API Endpoints
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', product: 'THE BID', world: 'IPL Cricket', timestamp: Date.now() });
+  res.json({
+    status: 'ok',
+    product: 'THE BID',
+    world: 'IPL Cricket',
+    usersCount: Object.keys(store.data.users || {}).length,
+    resetVersion: store.data.resetVersion || null,
+    timestamp: Date.now()
+  });
 });
 
 // Dedicated Native Google Authentication Endpoint (Server-Side Cryptographically Verified)
@@ -532,7 +539,10 @@ app.get('/api/profile/:uniqueId', (req, res) => {
   if (!reqId || typeof reqId !== 'string' || reqId.includes('..') || ['__proto__', 'constructor', 'prototype'].includes(reqId.toLowerCase())) {
     return res.status(400).json({ error: 'Invalid Player ID format' });
   }
-  let user = store.findUserByUniqueId(reqId);
+  let user = /^\d+$/.test(reqId) ? store.findUserByNumericId(reqId) : store.findUserByUniqueId(reqId);
+  if (!user) {
+    user = store.findUserByUniqueId(reqId);
+  }
   if (!user && Object.prototype.hasOwnProperty.call(store.data.users, reqId)) {
     user = store.data.users[reqId];
   }
@@ -770,7 +780,10 @@ app.post('/api/friends/search', (req, res) => {
     }
   }
 
-  let target = store.findUserByUniqueId(cleanTerm);
+  let target = /^\d+$/.test(cleanTerm) ? store.findUserByNumericId(cleanTerm) : store.findUserByUniqueId(cleanTerm);
+  if (!target) {
+    target = store.findUserByUniqueId(cleanTerm);
+  }
   if (!target && /^\d+$/.test(cleanTerm)) {
     target = store.findUserByNumericId(cleanTerm);
   }
@@ -788,7 +801,7 @@ app.post('/api/friends/search', (req, res) => {
 
   res.json({
     uniqueId: targetUniqueId,
-    numericPlayerId: target.numericPlayerId || target.legacyNumericPlayerId || null,
+    numericPlayerId: target.numericPlayerId || target.playerId || target.legacyNumericPlayerId || null,
     name: target.name,
     avatar: target.avatar,
     trophies: target.trophies || 0,

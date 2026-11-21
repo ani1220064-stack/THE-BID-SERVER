@@ -72,7 +72,7 @@ class StoreService {
         raw = fs.readFileSync(DATA_FILE, 'utf8');
       }
       let parsed = raw ? JSON.parse(raw) : null;
-      if (!parsed || !parsed.users || Object.keys(parsed.users).length === 0) {
+      if (!parsed || (!parsed.resetVersion && (!parsed.users || Object.keys(parsed.users).length === 0))) {
         const SEED_FILE = path.join(DATA_DIR, 'seed_store.json');
         if (fs.existsSync(SEED_FILE)) {
           console.log('[STORE] Seeding database from seed_store.json...');
@@ -191,6 +191,73 @@ class StoreService {
         }
       }
     }
+  }
+
+  /**
+   * Controlled Idempotent Reset of all THE BID Player & Progress Records.
+   * Completely purges all legacy/test accounts, friendships, trophies, and histories.
+   * Establishes fresh, clean state where verified Google accounts register afresh.
+   */
+  performFreshReset(force = false) {
+    if (this.data.resetVersion === 'FRESH_RESET_20261121' && !force) {
+      console.log('[STORE] Reset already performed (FRESH_RESET_20261121). Skipping to preserve new player records.');
+      return { skipped: true, resetVersion: this.data.resetVersion };
+    }
+
+    const removedCounts = {
+      users: Object.keys(this.data.users || {}).length,
+      googleUsers: Object.keys(this.data.googleUsers || {}).length,
+      numericPlayerIndex: Object.keys(this.data.numericPlayerIndex || {}).length,
+      uniqueIdIndex: Object.keys(this.data.uniqueIdIndex || {}).length,
+      friendships: Object.keys(this.data.friendships || {}).length,
+      friends: Object.keys(this.data.friends || {}).length,
+      friendRequests: Object.keys(this.data.friendRequests || {}).length,
+      matchHistory: Object.keys(this.data.matchHistory || {}).length,
+      trophyLedger: Object.keys(this.data.trophyLedger || {}).length,
+      roomInvitations: Object.keys(this.data.roomInvitations || {}).length,
+      activeRoomKeys: Object.keys(this.data.activeRoomKeys || {}).length,
+      outbox: (this.data.outbox || []).length
+    };
+
+    console.log('[STORE] Executing Controlled THE BID Player Database Reset:', JSON.stringify(removedCounts));
+
+    // Reset all player, progress, and multiplayer collections
+    this.data.users = {};
+    this.data.googleUsers = {};
+    this.data.uniqueIdIndex = {};
+    this.data.numericPlayerIndex = {};
+    this.data.nextNumericPlayerId = 1000001;
+    this.data.allocatedLoyaltyIds = [];
+    this.data.friends = {};
+    this.data.friendships = {};
+    this.data.friendRequests = {};
+    this.data.groups = {};
+    this.data.matchHistory = {};
+    this.data.trophyLedger = {};
+    this.data.roomInvitations = {};
+    this.data.activeRoomKeys = {};
+    this.data.customEntities = {};
+    this.data.outbox = [];
+    this.data.processedOperations = {};
+    this.data.resetVersion = 'FRESH_RESET_20261121';
+    this.data.resetPerformedAt = new Date().toISOString();
+    this.data.resetReport = {
+      timestamp: this.data.resetPerformedAt,
+      resetVersion: this.data.resetVersion,
+      removedCounts
+    };
+
+    // Commit to both store.json and seed_store.json so cold restarts on Render stay clean
+    this.saveData();
+    const SEED_FILE = path.join(DATA_DIR, 'seed_store.json');
+    try {
+      fs.writeFileSync(SEED_FILE, JSON.stringify(this.data, null, 2), 'utf8');
+    } catch (e) {
+      console.warn('[STORE] Could not update seed_store.json:', e.message);
+    }
+
+    console.log('[STORE] Database reset complete. Zero users, fresh ID allocation ready.');
+    return { success: true, removedCounts };
   }
 
   getCanonicalPair(uniqueIdA, uniqueIdB) {
@@ -525,6 +592,7 @@ class StoreService {
       googleId: cleanGoogleId,
       uniqueId,
       numericPlayerId,
+      playerId: numericPlayerId,
       legacyUniqueId: uniqueId,
       name: name || 'Bidder',
       nameSource: name ? 'GOOGLE_NAME' : 'GENERATED_NAME',
@@ -536,6 +604,9 @@ class StoreService {
       customPhotoUrl: null,
       isProfileSetupDone: false,
       trophies: 0,
+      matchesPlayed: 0,
+      wins: 0,
+      losses: 0,
       categoryTrophies: {
         ipl_cricket: 0,
         fifa_football: 0,

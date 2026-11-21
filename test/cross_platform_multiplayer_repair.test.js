@@ -78,40 +78,71 @@ async function runTests() {
   await delay(600);
 
   // --------------------------------------------------------------------------
-  // TEST 1: Permanent Identity & 7-Digit Player ID Lookups
+  // TEST 1: Permanent Identity, Controlled Reset & Reserved Loyalty Allocation
   // --------------------------------------------------------------------------
-  console.log('[TEST 1] Verifying 7-Digit Player ID & Founder Account Resolution...');
-  const lookup1000129 = store.findUserByNumericId('1000129');
-  assert(lookup1000129, 'Player ID 1000129 must resolve to permanent user record');
-  console.log(`  ✓ 1000129 resolved to: ${lookup1000129.name} (ID: ${lookup1000129.numericPlayerId}, Legacy: ${lookup1000129.legacyNumericPlayerId})`);
-
-  const lookup0000000 = store.findUserByNumericId('0000000');
-  assert(lookup0000000, 'Founder ID 0000000 must resolve to permanent user record');
-  console.log(`  ✓ 0000000 resolved to: ${lookup0000000.name}`);
-
-  // Test Google Auth resolution for both emails
+  console.log('[TEST 1] Verifying Fresh Reset, Founder ID 0000000 & 10 Loyalty IDs...');
+  
+  // Test Google Auth resolution for Founder (first login creates 0000000)
   const authRes1 = await postJson('/api/auth/google/native', {
-    idToken: 'test_sub_ani1:test_sub_ani1:Anirudh:anirudhchaturvedi122006@gmail.com'
+    idToken: 'test_sub_ani1:test_sub_ani1:Anirudh:ani1220064@gmail.com'
   });
-  assert.strictEqual(authRes1.status, 200, 'Google auth for anirudhchaturvedi122006@gmail.com must succeed');
+  assert.strictEqual(authRes1.status, 200, 'Google auth for ani1220064@gmail.com must succeed');
   assert.strictEqual(authRes1.data.user.numericPlayerId, '0000000', 'Must resolve to Founder ID 0000000');
-  console.log(`  ✓ anirudhchaturvedi122006@gmail.com mapped to: ${authRes1.data.user.name} [${authRes1.data.user.numericPlayerId}]`);
+  assert.strictEqual(authRes1.data.user.trophies, 0, 'Initial trophies must be 0');
+  assert.strictEqual(authRes1.data.user.matchesPlayed, 0, 'Initial matches must be 0');
+  assert.strictEqual(authRes1.data.friends.length, 0, 'Initial friends must be empty');
+  console.log(`  ✓ Founder Google login (ani1220064@gmail.com) created: ${authRes1.data.user.name} [ID: ${authRes1.data.user.numericPlayerId}], trophies: ${authRes1.data.user.trophies}`);
 
+  // Test secondary founder email resolves to the exact same account
   const authRes2 = await postJson('/api/auth/google/native', {
-    idToken: 'test_sub_ani2:test_sub_ani2:Anirudh:ani1220064@gmail.com'
+    idToken: 'test_sub_ani2:test_sub_ani2:Anirudh:anirudhchaturvedi122006@gmail.com'
   });
-  assert.strictEqual(authRes2.status, 200, 'Google auth for ani1220064@gmail.com must succeed');
-  assert.strictEqual(authRes2.data.user.numericPlayerId, '0000000', 'Must resolve to Founder ID 0000000');
-  console.log(`  ✓ ani1220064@gmail.com mapped to: ${authRes2.data.user.name} [${authRes2.data.user.numericPlayerId}]`);
+  assert.strictEqual(authRes2.status, 200, 'Google auth for anirudhchaturvedi122006@gmail.com must succeed');
+  assert.strictEqual(authRes2.data.user.numericPlayerId, '0000000', 'Must resolve to same Founder ID 0000000');
+  console.log(`  ✓ Secondary Founder email (anirudhchaturvedi122006@gmail.com) mapped to same ID: ${authRes2.data.user.numericPlayerId}`);
 
-  // Friend search via REST API
-  const searchRes = await postJson('/api/friends/search', {
-    searchTerm: '1000129',
-    searcherUniqueId: 'BID-TESTER-1'
+  // Test First 10 other verified Google accounts receive reserved loyalty IDs
+  const expectedLoyaltyIds = [
+    '1111111', '2222222', '3333333', '4444444', '5555555',
+    '6666666', '7777777', '8888888', '9999999', '1000000'
+  ];
+  for (let i = 0; i < 10; i++) {
+    const lEmail = `early.player.${i + 1}@gmail.com`;
+    const lSub = `test_sub_early_${i + 1}`;
+    const lAuth = await postJson('/api/auth/google/native', {
+      idToken: `${lSub}:${lSub}:Early Player ${i + 1}:${lEmail}`
+    });
+    assert.strictEqual(lAuth.status, 200);
+    assert.strictEqual(lAuth.data.user.numericPlayerId, expectedLoyaltyIds[i], `Player #${i + 1} must receive ${expectedLoyaltyIds[i]}`);
+    assert.strictEqual(lAuth.data.user.trophies, 0);
+  }
+  console.log(`  ✓ All 10 Early Verified Google Accounts received reserved IDs (1111111 -> 1000000)`);
+
+  // Test 11th account receives normal 7-digit ID (1000001+)
+  const norm11 = await postJson('/api/auth/google/native', {
+    idToken: `test_sub_regular_11:test_sub_regular_11:Regular Player 11:regular11@gmail.com`
   });
-  assert.strictEqual(searchRes.status, 200, 'Friend search for 1000129 must return 200 OK');
-  assert.strictEqual(searchRes.data.name, 'Anirudh', 'Target name must match Anirudh');
-  console.log(`  ✓ /api/friends/search for 1000129 returned: ${searchRes.data.name} (${searchRes.data.numericPlayerId})\n`);
+  assert.strictEqual(norm11.status, 200);
+  assert.strictEqual(norm11.data.user.numericPlayerId, '1000001', '11th account must receive 1000001');
+  console.log(`  ✓ 11th Verified Google Account received regular ID: ${norm11.data.user.numericPlayerId}`);
+
+  // Friend search for Founder ID 0000000
+  const searchFounder = await postJson('/api/friends/search', {
+    searchTerm: '0000000',
+    searcherUniqueId: norm11.data.user.uniqueId
+  });
+  assert.strictEqual(searchFounder.status, 200, 'Friend search for 0000000 must return 200 OK');
+  assert.strictEqual(searchFounder.data.numericPlayerId, '0000000', 'Target ID must be 0000000');
+  console.log(`  ✓ /api/friends/search for 0000000 returned: ${searchFounder.data.name} (${searchFounder.data.numericPlayerId})`);
+
+  // Friend search for Early Player 1 (1111111)
+  const searchEarly1 = await postJson('/api/friends/search', {
+    numericPlayerId: '1111111',
+    searcherUniqueId: authRes1.data.user.uniqueId
+  });
+  assert.strictEqual(searchEarly1.status, 200, 'Friend search for 1111111 must return 200 OK');
+  assert.strictEqual(searchEarly1.data.numericPlayerId, '1111111', 'Target ID must be 1111111');
+  console.log(`  ✓ /api/friends/search for 1111111 returned: ${searchEarly1.data.name} (${searchEarly1.data.numericPlayerId})\n`);
 
   // --------------------------------------------------------------------------
   // TEST 2: Combination 1 (APK <-> APK) - Room Joining & Franchise Conflict
