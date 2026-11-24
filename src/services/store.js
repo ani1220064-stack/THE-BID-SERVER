@@ -32,8 +32,7 @@ const defaultState = {
 
 // Section 4: Special Player IDs & Early Loyalty Tier
 const FOUNDER_EMAILS = [
-  'ani1220064@gmail.com',
-  'anirudhchaturvedi122006@gmail.com'
+  'ani1220064@gmail.com'
 ];
 const isFounderEmail = (em) => {
   if (!em) return false;
@@ -500,12 +499,10 @@ class StoreService {
       }
     }
 
-    // 2. Safe Migration for Founder account (e.g. Anirudh's existing primary account)
+    // 2. Safe Migration for Founder account
     if (isFounder) {
       const existingFounderAccount = Object.values(this.data.users || {}).find(u => 
-        (u.email && isFounderEmail(u.email)) ||
-        (u.uniqueId === 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc') ||
-        (u.id === 'guest_inst_134182cf-db2a-4cac-b638-86b72bd709bc')
+        u.email && isFounderEmail(u.email)
       );
 
       if (existingFounderAccount) {
