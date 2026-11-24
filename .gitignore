@@ -18,4 +18,15 @@ yarn-error.log*
 !data/seed_store.json
 data/*.bak
 data/*.tmp
+data/archives/
+data/CLEANUP_MANIFEST.json
+data/migration_report_numeric_ids.json
+data/store.pre_freeze_backup.json
+data/store_BEFORE_NUMERIC_APPLY_*.json
+data/store_migrated_numeric_ids.json
+
+# Untracked test files & test APKs
+public/the-bid-test.apk
+public/*.idsig
+
 

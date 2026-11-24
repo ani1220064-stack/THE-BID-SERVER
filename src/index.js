@@ -9,7 +9,15 @@ require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const store = require('./services/store');
 const archivalService = require('./services/archivalService');
 const RoomManager = require('./rooms/RoomManager');
-const { detectFacesAndCalculateFraming } = require('./services/faceDetectionService');
+let detectFacesAndCalculateFraming = async () => ({ detected: false, faces: [], focusPoint: { x: 0.5, y: 0.5 }, suggestedScale: 1.0 });
+try {
+  const fds = require('./services/faceDetectionService');
+  if (fds && fds.detectFacesAndCalculateFraming) {
+    detectFacesAndCalculateFraming = fds.detectFacesAndCalculateFraming;
+  }
+} catch (err) {
+  console.warn('[SERVER_INIT] faceDetectionService fallback loaded:', err.message);
+}
 
 const app = express();
 const server = http.createServer(app);

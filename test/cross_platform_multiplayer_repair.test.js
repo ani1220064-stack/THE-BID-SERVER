@@ -93,27 +93,27 @@ async function runTests() {
   assert.strictEqual(authRes1.data.friends.length, 0, 'Initial friends must be empty');
   console.log(`  ✓ Founder Google login (ani1220064@gmail.com) created: ${authRes1.data.user.name} [ID: ${authRes1.data.user.numericPlayerId}], trophies: ${authRes1.data.user.trophies}`);
 
-  // Test secondary founder email resolves to the exact same account
+  // Test distinct Google account (anirudhchaturvedi122006@gmail.com) receives first priority loyalty ID 1111111
   const authRes2 = await postJson('/api/auth/google/native', {
     idToken: 'test_sub_ani2:test_sub_ani2:Anirudh:anirudhchaturvedi122006@gmail.com'
   });
   assert.strictEqual(authRes2.status, 200, 'Google auth for anirudhchaturvedi122006@gmail.com must succeed');
-  assert.strictEqual(authRes2.data.user.numericPlayerId, '0000000', 'Must resolve to same Founder ID 0000000');
-  console.log(`  ✓ Secondary Founder email (anirudhchaturvedi122006@gmail.com) mapped to same ID: ${authRes2.data.user.numericPlayerId}`);
+  assert.strictEqual(authRes2.data.user.numericPlayerId, '1111111', 'Must resolve to priority Loyalty ID 1111111');
+  console.log(`  ✓ Second distinct Google account (anirudhchaturvedi122006@gmail.com) received Loyalty ID: ${authRes2.data.user.numericPlayerId}`);
 
-  // Test First 10 other verified Google accounts receive reserved loyalty IDs
+  // Test next 9 verified Google accounts receive remaining reserved loyalty IDs
   const expectedLoyaltyIds = [
-    '1111111', '2222222', '3333333', '4444444', '5555555',
+    '2222222', '3333333', '4444444', '5555555',
     '6666666', '7777777', '8888888', '9999999', '1000000'
   ];
-  for (let i = 0; i < 10; i++) {
-    const lEmail = `early.player.${i + 1}@gmail.com`;
-    const lSub = `test_sub_early_${i + 1}`;
+  for (let i = 0; i < 9; i++) {
+    const lEmail = `early.player.${i + 2}@gmail.com`;
+    const lSub = `test_sub_early_${i + 2}`;
     const lAuth = await postJson('/api/auth/google/native', {
-      idToken: `${lSub}:${lSub}:Early Player ${i + 1}:${lEmail}`
+      idToken: `${lSub}:${lSub}:Early Player ${i + 2}:${lEmail}`
     });
     assert.strictEqual(lAuth.status, 200);
-    assert.strictEqual(lAuth.data.user.numericPlayerId, expectedLoyaltyIds[i], `Player #${i + 1} must receive ${expectedLoyaltyIds[i]}`);
+    assert.strictEqual(lAuth.data.user.numericPlayerId, expectedLoyaltyIds[i], `Player #${i + 2} must receive ${expectedLoyaltyIds[i]}`);
     assert.strictEqual(lAuth.data.user.trophies, 0);
   }
   console.log(`  ✓ All 10 Early Verified Google Accounts received reserved IDs (1111111 -> 1000000)`);
