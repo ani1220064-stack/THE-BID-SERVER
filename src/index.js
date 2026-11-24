@@ -808,14 +808,32 @@ app.post('/api/friends/search', (req, res) => {
     return res.status(404).json({ error: 'Player not found or is in guest mode' });
   }
 
-  const targetUniqueId = target.uniqueId || target.id;
+  // Canonicalize target Player ID (enforcing reserved founder/loyalty rules)
+  const emailLower = target.email ? String(target.email).trim().toLowerCase() : '';
+  const isFounder = (emailLower === 'ani1220064@gmail.com') ||
+                    target.isFounder ||
+                    target.googleId === '111044643998881545528' ||
+                    (store.data.numericPlayerIndex && store.data.numericPlayerIndex['0000000'] === target.id) ||
+                    (target.avatar && String(target.avatar).includes('ACg8ocJRGDIVP'));
+
+  const isLoyalty1 = (emailLower === 'anirudhchaturvedi122006@gmail.com') ||
+                     (store.data.numericPlayerIndex && store.data.numericPlayerIndex['1111111'] === target.id) ||
+                     (target.avatar && String(target.avatar).includes('ACg8ocIGzEkhGF'));
+
+  const canonicalNumId = isFounder
+    ? '0000000'
+    : (isLoyalty1
+      ? '1111111'
+      : (target.numericPlayerId || target.uniqueId || cleanTerm));
+
+  const targetUniqueId = canonicalNumId;
   const relationship = searcherUniqueId
     ? store.getPlayerRelationship(searcherUniqueId, targetUniqueId)
     : 'NOT_FRIENDS';
 
   res.json({
-    uniqueId: targetUniqueId,
-    numericPlayerId: target.numericPlayerId || target.playerId || target.legacyNumericPlayerId || null,
+    uniqueId: canonicalNumId,
+    numericPlayerId: canonicalNumId,
     name: target.name,
     avatar: target.avatar,
     trophies: target.trophies || 0,
@@ -981,18 +999,21 @@ app.get('/api/friends/:uniqueId', (req, res) => {
   if (!reqId || typeof reqId !== 'string' || reqId.includes('..') || ['__proto__', 'constructor', 'prototype'].includes(reqId.toLowerCase())) {
     return res.status(400).json({ error: 'Invalid Player ID format' });
   }
-  const user = store.findUserByUniqueId(reqId);
+  const user = store.findUserByUniqueId(reqId) || store.findUserByNumericId(reqId);
   const rawFriends = store.getFriendsList(reqId);
   const friends = rawFriends.map(f => {
     const norm = (f.uniqueId || '').trim().toUpperCase();
-    const hasSockets = userSockets.has(norm) && userSockets.get(norm).size > 0;
+    const normNum = f.numericPlayerId ? String(f.numericPlayerId).trim().toUpperCase() : '';
+    const hasSockets = (userSockets.has(norm) && userSockets.get(norm).size > 0) ||
+                       (normNum && userSockets.has(normNum) && userSockets.get(normNum).size > 0);
     // In staging test mode, test accounts show as AVAILABLE online
     const isTestAccount = f.isStagingTestAccount || (f.numericPlayerId && f.numericPlayerId.startsWith('10001'));
     const status = isTestAccount ? 'AVAILABLE' : roomManager.getUserPresence(norm, hasSockets);
     return { ...f, status, isOnline: status !== 'OFFLINE' };
   });
   const requests = store.getFriendRequests(reqId);
-  res.json({ friends, requests, numericPlayerId: user?.numericPlayerId || null });
+  const canonicalNumId = user ? (user.numericPlayerId || (user.isFounder ? '0000000' : user.uniqueId)) : null;
+  res.json({ friends, requests, numericPlayerId: canonicalNumId });
 });
 
 // STAGING TEST SUITE REST ENDPOINTS (Active ONLY when STAGING_MULTIPLAYER_TEST === 'true')
