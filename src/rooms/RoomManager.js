@@ -589,6 +589,41 @@ class RoomManager {
     }
   }
 
+  cleanupAndCloseRoom(room) {
+    if (!room) return;
+    if (room.timerInterval) clearInterval(room.timerInterval);
+    if (room.lotTimeout) clearTimeout(room.lotTimeout);
+    if (room.aiBidTimeout) clearTimeout(room.aiBidTimeout);
+    if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
+
+    if (room.roomCode) {
+      this.roomCodes.delete(this.normalizeRoomCode(room.roomCode));
+      if (store.releaseRoomKey) {
+        store.releaseRoomKey(room.roomCode);
+      }
+    }
+    store.cancelInvitationsForRoom(room.id);
+    this.rooms.delete(room.id);
+
+    // Notify presence change for all human participants in the room
+    for (const p of room.participants.values()) {
+      if (!p.isAI && p.uniqueId) {
+        const normU = p.uniqueId.trim().toUpperCase();
+        this.userLifecycle.set(normU, 'AVAILABLE');
+        if (this.onPresenceChanged) {
+          this.onPresenceChanged(normU);
+        }
+      }
+    }
+
+    // Notify any remaining sockets in the room that room has closed
+    this.io.to(room.id).emit('room_closed', {
+      roomId: room.id,
+      message: 'Host has closed or left the room.'
+    });
+    console.log(`[RoomManager] Room ${room.id} closed and cleaned up.`);
+  }
+
   leaveRoom(roomId, userId, uniqueId) {
     const room = this.resolveRoom(roomId);
     if (!room) return { success: false, message: 'Room not found' };
@@ -625,30 +660,6 @@ class RoomManager {
       room.budgetVotes.delete(participantId);
     }
 
-    const isLiveAuction = room.state === 'AUCTION_ACTIVE' || room.state === 'SOLD' || room.state === 'UNSOLD' || room.state === 'PAUSED';
-
-    // Remove or convert participant
-    if (isLiveAuction && !wasHost) {
-      // In live auction with remaining humans, convert leaving player to computer bot
-      // to maintain competitive roster integrity without breaking squad allocations or current leader bids
-      leavingParticipant.isAI = true;
-      leavingParticipant.type = 'COMPUTER';
-      leavingParticipant.name = `${leavingParticipant.name} (AI)`;
-
-      const bot = new AuctionBot({
-        id: leavingParticipant.id,
-        name: leavingParticipant.name,
-        teamId: leavingParticipant.teamId,
-        teamName: leavingParticipant.teamName,
-        strategy: 'balanced',
-        avatar: leavingParticipant.avatar,
-        difficulty: room.aiDifficulty || 'MEDIUM'
-      });
-      room.bots.push(bot);
-    } else {
-      room.participants.delete(participantId);
-    }
-
     // Update lifecycle state of leaving user to AVAILABLE
     if (effectiveUniqueId) {
       const normU = effectiveUniqueId.trim().toUpperCase();
@@ -661,69 +672,95 @@ class RoomManager {
       }
     }
 
-    console.log(`[RoomManager] User ${participantId} (${effectiveUniqueId}) left room ${roomId}. Remaining participants: ${room.participants.size}`);
+    const isLiveAuction = room.state === 'AUCTION_ACTIVE' || room.state === 'SOLD' || room.state === 'UNSOLD' || room.state === 'PAUSED';
 
-    // If host leaves or no human participants remain:
-    const remainingHumans = Array.from(room.participants.values()).filter(p => !p.isAI);
-    if (wasHost || remainingHumans.length === 0) {
-      // Safest existing room behavior: close room when host leaves or when empty
-      if (room.timerInterval) clearInterval(room.timerInterval);
-      if (room.lotTimeout) clearTimeout(room.lotTimeout);
-      if (room.aiBidTimeout) clearTimeout(room.aiBidTimeout);
-      if (room.pauseTimeout) clearTimeout(room.pauseTimeout);
+    // 1. LIVE AUCTION WITHDRAWAL
+    if (isLiveAuction) {
+      leavingParticipant.hasLeft = true;
+      leavingParticipant.hasWithdrawn = true;
+      leavingParticipant.status = 'WITHDRAWN';
+      leavingParticipant.isDisconnected = true;
+      leavingParticipant.isAI = false;
 
-      if (room.roomCode) {
-        this.roomCodes.delete(this.normalizeRoomCode(room.roomCode));
-        if (store.releaseRoomKey) {
-          store.releaseRoomKey(room.roomCode);
-        }
+      // If the leaving player was the current leader on active lot, clear their bid deterministically
+      if (room.currentLeader && (room.currentLeader.id === participantId || room.currentLeader.userId === participantId)) {
+        console.log(`[RoomManager] Withdrawing player ${participantId} was current leader on lot ${room.currentLotNumber}. Resetting lot bid.`);
+        room.currentLeader = null;
+        room.currentBid = room.currentPlayer ? (room.currentPlayer.basePrice || 0) : 0;
+        room.timerSeconds = Math.round((room.lotDurationMs || 10000) / 1000);
       }
-      store.cancelInvitationsForRoom(roomId);
-      this.rooms.delete(roomId);
 
-      // Notify presence change for all human participants in the room
-      for (const p of room.participants.values()) {
-        if (!p.isAI && p.uniqueId) {
-          const normU = p.uniqueId.trim().toUpperCase();
-          this.userLifecycle.set(normU, 'AVAILABLE');
-          if (this.onPresenceChanged) {
-            this.onPresenceChanged(normU);
+      // Check remaining active competitors
+      const activeCompetitors = Array.from(room.participants.values()).filter(p => !p.hasLeft && !p.hasWithdrawn && p.status !== 'WITHDRAWN');
+      const activeHumans = activeCompetitors.filter(p => !p.isAI);
+
+      console.log(`[RoomManager] Live Auction Withdrawal: Room ${roomId}. Active competitors remaining: ${activeCompetitors.length} (${activeHumans.length} humans)`);
+
+      // Rule 2: If exactly 1 competitor remains (whether human or bot), that sole participant automatically wins the entire auction!
+      if (activeCompetitors.length === 1) {
+        const soleWinner = activeCompetitors[0];
+        console.log(`[RoomManager] Sole Remaining Participant Winner Triggered: ${soleWinner.name} (${soleWinner.id}) wins room ${roomId}!`);
+        this.finishAuction(room);
+        this.broadcastRoomState(room);
+        return { success: true, soleWinner: soleWinner.name, room };
+      } else if (activeCompetitors.length === 0) {
+        // No competitors left at all, close room safely
+        this.cleanupAndCloseRoom(room);
+        return { success: true, roomClosed: true };
+      } else {
+        // Rule 1: 3 or more participants (or 2+ active competitors remaining)
+        // Rule 3: If host leaves, transfer host authority to the next active human player
+        if (wasHost) {
+          const nextHost = activeHumans[0] || activeCompetitors[0];
+          if (nextHost) {
+            room.hostId = nextHost.id;
+            nextHost.isHost = true;
+            console.log(`[RoomManager] Host authority transferred to ${nextHost.name} (${nextHost.id})`);
           }
         }
-      }
 
-      // Notify any remaining sockets in the room that room has closed
-      this.io.to(roomId).emit('room_closed', {
-        roomId,
-        message: 'Host has closed or left the room.'
-      });
-      console.log(`[RoomManager] Room ${roomId} closed and cleaned up.`);
-      return { success: true, roomClosed: true };
-    } else {
-      // If a finish auction request is currently pending, update voting tally
-      if (room.finishVoteState === 'FINISH_REQUESTED' && room.finishVote) {
-        if (leavingParticipant.isAI) {
-          // Converted to bot: AI bots auto-agree to finish requests
-          room.finishVote.votes[participantId] = true;
-        } else {
+        // If a finish auction request is currently pending, update voting tally
+        if (room.finishVoteState === 'FINISH_REQUESTED' && room.finishVote) {
           delete room.finishVote.votes[participantId];
+          const eligible = this.getActiveEligibleParticipants(room);
+          const eligibleIds = eligible.map(e => e.id);
+          room.finishVote.eligibleParticipantIds = eligibleIds;
+          room.finishVote.totalRequired = eligibleIds.length;
+          const agreedCount = eligibleIds.filter(id => room.finishVote.votes[id] === true).length;
+          room.finishVote.agreedCount = agreedCount;
+          if (agreedCount >= room.finishVote.totalRequired && room.finishVote.totalRequired > 0) {
+            this.resolveAndFinishAuction(room);
+            return { success: true, roomClosed: false, room };
+          }
         }
 
-        const eligible = this.getActiveEligibleParticipants(room);
-        const eligibleIds = eligible.map(e => e.id);
-        room.finishVote.eligibleParticipantIds = eligibleIds;
-        room.finishVote.totalRequired = eligibleIds.length;
-        const agreedCount = eligibleIds.filter(id => room.finishVote.votes[id] === true).length;
-        room.finishVote.agreedCount = agreedCount;
+        this.broadcastRoomState(room);
+        return { success: true, withdrawn: true, room };
+      }
+    } else {
+      // 2. PRE-AUCTION (LOBBY / SETUP / BUDGET_SELECTION)
+      room.participants.delete(participantId);
 
-        // If remaining participants now reach 100% agreement
-        if (agreedCount >= room.finishVote.totalRequired && room.finishVote.totalRequired > 0) {
-          this.resolveAndFinishAuction(room);
-          return { success: true, roomClosed: false, room };
+      const remainingHumans = Array.from(room.participants.values()).filter(p => !p.isAI);
+      if (wasHost) {
+        if (remainingHumans.length > 0) {
+          // Transfer host to next active human player
+          const nextHost = remainingHumans[0];
+          room.hostId = nextHost.id;
+          nextHost.isHost = true;
+          console.log(`[RoomManager] Pre-Auction Host transferred to ${nextHost.name} (${nextHost.id})`);
+          this.broadcastRoomState(room);
+          return { success: true, newHost: nextHost.id, room };
+        } else {
+          // No humans left, close room safely
+          this.cleanupAndCloseRoom(room);
+          return { success: true, roomClosed: true };
         }
+      } else if (remainingHumans.length === 0) {
+        this.cleanupAndCloseRoom(room);
+        return { success: true, roomClosed: true };
       }
 
-      // Room continues with remaining participants: broadcast updated room state
       this.broadcastRoomState(room);
       return { success: true, roomClosed: false, room };
     }
@@ -1942,7 +1979,7 @@ class RoomManager {
 
         // Notify client immediately via socket so trophies and history refresh without delay
         const socketId = p.socketId;
-        if (socketId) {
+        if (socketId && this.io && this.io.to) {
           const userObj = (result && result.user) || store.findUserByUniqueId(targetId);
           this.io.to(socketId).emit('user_profile_updated', {
             user: userObj,
@@ -1956,7 +1993,9 @@ class RoomManager {
     });
 
     this.broadcastRoomState(room);
-    this.io.to(room.id).emit('auction_finished', evaluation);
+    if (this.io && this.io.to) {
+      this.io.to(room.id).emit('auction_finished', evaluation);
+    }
 
     // Notify presence change: match has finished, participants return to AVAILABLE
     room.participants.forEach(p => {
@@ -1973,7 +2012,32 @@ class RoomManager {
   // Signature AI Analysis Engine (Screen 29 & 30) - Delegated to Category Module
   computeAIAnalysis(room) {
     const categoryModule = CategoryRegistry.get(room.category);
-    return categoryModule.generateAnalysis(room);
+    const evaluation = categoryModule.generateAnalysis(room) || { rankings: [] };
+    const activeCompetitors = Array.from(room.participants.values()).filter(p => !p.hasLeft && !p.hasWithdrawn && p.status !== 'WITHDRAWN');
+    if (activeCompetitors.length === 1 && evaluation.rankings) {
+      const soleWinner = activeCompetitors[0];
+      evaluation.rankings.sort((a, b) => {
+        if (a.id === soleWinner.id) return -1;
+        if (b.id === soleWinner.id) return 1;
+        return 0;
+      });
+      evaluation.winner = soleWinner;
+    } else if (evaluation.rankings && evaluation.rankings.length > 0) {
+      // Withdrawn competitors must be sorted to the bottom
+      evaluation.rankings.sort((a, b) => {
+        const pA = room.participants.get(a.id);
+        const pB = room.participants.get(b.id);
+        const aWithdrawn = pA && (pA.hasLeft || pA.hasWithdrawn || pA.status === 'WITHDRAWN');
+        const bWithdrawn = pB && (pB.hasLeft || pB.hasWithdrawn || pB.status === 'WITHDRAWN');
+        if (aWithdrawn && !bWithdrawn) return 1;
+        if (!aWithdrawn && bWithdrawn) return -1;
+        return 0;
+      });
+      if (evaluation.rankings[0]) {
+        evaluation.winner = room.participants.get(evaluation.rankings[0].id) || evaluation.rankings[0];
+      }
+    }
+    return evaluation;
   }
 
   serializeRoom(room) {
@@ -2014,7 +2078,9 @@ class RoomManager {
   broadcastRoomState(room) {
     if (!room || !room.id) return;
     const payload = this.serializeRoom(room);
-    this.io.to(room.id).emit('room_state', payload);
+    if (this.io && this.io.to) {
+      this.io.to(room.id).emit('room_state', payload);
+    }
   }
 
   broadcastReaction(roomId, userId, text, options = {}) {

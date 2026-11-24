@@ -1468,8 +1468,19 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Check for any pending room invitations upon connecting/registering (unexpired only)
-    const pendingInvites = store.getPendingInvitations(normId).filter(inv => !inv.expiresAt || inv.expiresAt > Date.now());
+    // Check for any pending room invitations upon connecting/registering (unexpired and joinable rooms only)
+    const pendingInvites = store.getPendingInvitations(normId).filter(inv => {
+      if (inv.expiresAt && inv.expiresAt <= Date.now()) {
+        store.updateInvitationStatus(inv.id, 'EXPIRED');
+        return false;
+      }
+      const room = roomManager.resolveRoom(inv.roomId);
+      if (!room || (room.state !== 'LOBBY' && room.state !== 'SETUP' && room.state !== 'BUDGET_SELECTION')) {
+        store.updateInvitationStatus(inv.id, 'CANCELLED');
+        return false;
+      }
+      return true;
+    });
     if (pendingInvites.length > 0) {
       socket.emit('room_invitations_batch', pendingInvites);
     }
@@ -1480,19 +1491,10 @@ io.on('connection', (socket) => {
       socket.emit('friend_requests_batch', pendingRequests);
     }
 
-    // Reconcile and clear pending transactional outbox events for this user upon reconnect
-    // (Pending friend requests are already safely delivered via friend_requests_batch to avoid populating intrusive popups on startup)
+    // Clear pending transactional outbox events for this user upon reconnect
+    // (Pending room invitations and friend requests are already safely delivered via batches above to avoid duplicate delivery)
     const pendingOutbox = store.getPendingOutboxEvents(normId);
     for (const evt of pendingOutbox) {
-      if (evt.eventType === 'ROOM_INVITATION_SENT') {
-        const inv = evt.payload.invitation;
-        if (inv && (!inv.expiresAt || inv.expiresAt > Date.now())) {
-          socket.emit('room_invitation_received', {
-            ...inv,
-            outboxEventId: evt.eventId
-          });
-        }
-      }
       store.markOutboxEventDispatched(evt.eventId);
     }
 
@@ -1836,6 +1838,14 @@ io.on('connection', (socket) => {
     if (friendActiveRoom && friendActiveRoom.id !== room.id) {
       console.log(`[send_room_invite BUSY BLOCK] normFriend=${normFriend}, friendActiveRoom=${friendActiveRoom.id}, room.id=${room.id}, participants=`, Array.from(friendActiveRoom.participants.values()).map(p => ({ id: p.id, uniqueId: p.uniqueId, isAI: p.isAI })));
       socket.emit('error_message', { message: 'Friend is currently busy in another match.' });
+      return;
+    }
+
+    // Verification 5: Recipient must be genuinely online
+    const hasRecipientSockets = userSockets.has(normFriend) && userSockets.get(normFriend).size > 0;
+    const isStagingMode = process.env.STAGING_MULTIPLAYER_TEST === 'true';
+    if (!hasRecipientSockets && !isStagingMode) {
+      socket.emit('error_message', { message: 'Player is currently offline and cannot receive invitations.' });
       return;
     }
 
