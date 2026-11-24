@@ -150,7 +150,7 @@ async function runTests() {
   console.log('[TEST 2] Testing APK <-> APK: Room Code Join & Real-Time RCB Reservation...');
   const apkUser1 = {
     id: 'user_apk_host',
-    uniqueId: 'BID-APK-HOST',
+    uniqueId: '2000001',
     numericPlayerId: '2000001',
     name: 'APK Host',
     avatar: 'avatar_male_1',
@@ -158,7 +158,7 @@ async function runTests() {
   };
   const apkUser2 = {
     id: 'user_apk_guest',
-    uniqueId: 'BID-APK-GUEST',
+    uniqueId: '2000002',
     numericPlayerId: '2000002',
     name: 'APK Guest',
     avatar: 'avatar_female_1',
@@ -249,7 +249,7 @@ async function runTests() {
   console.log('[TEST 3] Testing Web <-> Web: PWA Room Joining & State Synchronization...');
   const webUser1 = {
     id: 'user_web_host',
-    uniqueId: 'BID-WEB-HOST',
+    uniqueId: '3000001',
     numericPlayerId: '3000001',
     name: 'Web Host',
     avatar: 'avatar_male_2',
@@ -257,7 +257,7 @@ async function runTests() {
   };
   const webUser2 = {
     id: 'user_web_guest',
-    uniqueId: 'BID-WEB-GUEST',
+    uniqueId: '3000002',
     numericPlayerId: '3000002',
     name: 'Web Guest',
     avatar: 'avatar_female_2',
@@ -301,7 +301,7 @@ async function runTests() {
   console.log('[TEST 4] Testing APK <-> Web: Direct Room Invite Delivery & Acceptance...');
   const crossApkHost = {
     id: 'user_cross_apk',
-    uniqueId: 'BID-CROSS-APK',
+    uniqueId: '4000001',
     numericPlayerId: '4000001',
     name: 'APK Player',
     avatar: 'avatar_male_1',
@@ -309,7 +309,7 @@ async function runTests() {
   };
   const crossWebGuest = {
     id: 'user_cross_web',
-    uniqueId: 'BID-CROSS-WEB',
+    uniqueId: '4000002',
     numericPlayerId: '4000002',
     name: 'Web Player',
     avatar: 'avatar_female_1',
@@ -374,7 +374,7 @@ async function runTests() {
   const runId = Math.floor(Math.random() * 899999 + 100000);
   const userWebRequester = {
     id: `user_web_req_${runId}`,
-    uniqueId: `BID-WEBREQ-${runId}`,
+    uniqueId: `5${String(runId).slice(-6)}`,
     numericPlayerId: `5${String(runId).slice(-6)}`,
     name: 'Web Requester',
     avatar: 'avatar_male_1',
@@ -382,7 +382,7 @@ async function runTests() {
   };
   const userApkRecipient = {
     id: `user_apk_rec_${runId}`,
-    uniqueId: `BID-APKREC-${runId}`,
+    uniqueId: `6${String(runId).slice(-6)}`,
     numericPlayerId: `6${String(runId).slice(-6)}`,
     name: 'APK Recipient',
     avatar: 'avatar_female_1',

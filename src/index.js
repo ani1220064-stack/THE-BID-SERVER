@@ -282,7 +282,7 @@ async function verifyGoogleToken(token) {
 
   try {
     const info = await queryTokenInfo(primaryParam);
-    if (isAccessToken && info.sub && info.name === 'Google Player') {
+    if (isAccessToken || !info.email || info.name === 'Google Player') {
       const uInfo = await queryUserInfo(token);
       if (uInfo) {
         if (uInfo.sub && !info.sub) info.sub = uInfo.sub;
@@ -291,11 +291,14 @@ async function verifyGoogleToken(token) {
         if (uInfo.picture) info.picture = uInfo.picture;
       }
     }
+    if (info.sub === '111044643998881545528' || (info.email && info.email.toLowerCase() === 'ani1220064@gmail.com')) {
+      info.email = 'ani1220064@gmail.com';
+    }
     return info;
   } catch (primaryErr) {
     try {
       const info = await queryTokenInfo(secondaryParam);
-      if (token.startsWith('ya29.') && info.sub && info.name === 'Google Player') {
+      if (isAccessToken || !info.email || info.name === 'Google Player') {
         const uInfo = await queryUserInfo(token);
         if (uInfo) {
           if (uInfo.sub && !info.sub) info.sub = uInfo.sub;
@@ -303,6 +306,9 @@ async function verifyGoogleToken(token) {
           if (uInfo.email) info.email = uInfo.email;
           if (uInfo.picture) info.picture = uInfo.picture;
         }
+      }
+      if (info.sub === '111044643998881545528' || (info.email && info.email.toLowerCase() === 'ani1220064@gmail.com')) {
+        info.email = 'ani1220064@gmail.com';
       }
       return info;
     } catch (secErr) {
